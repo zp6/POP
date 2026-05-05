@@ -6761,3 +6761,404 @@ contract MockToken is Test, IERC20 {
                 assertEq(spent, 0, "Bootstrap spent should be zero");
             }
         }
+
+        contract TaskManagerCreateTasksBatchTest is TaskManagerTestBase {
+            bytes32 PID;
+            bytes32 BOUNTY_PID;
+            MockERC20 bountyToken;
+
+            function setUp() public {
+                setUpBase();
+                bountyToken = new MockERC20();
+                bountyToken.mint(address(tm), 1000 ether);
+
+                PID = _createDefaultProject("BATCH", 0);
+
+                address[] memory tokens = new address[](1);
+                tokens[0] = address(bountyToken);
+                uint256[] memory caps = new uint256[](1);
+                caps[0] = 5 ether;
+                BOUNTY_PID = _createProjectWithBountyBudget("BATCH_BOUNTY", 10 ether, tokens, caps);
+            }
+
+            function _mkInput(uint256 payout, bytes memory title)
+                internal
+                pure
+                returns (TaskManager.CreateTaskInput memory)
+            {
+                return TaskManager.CreateTaskInput({
+                    payout: payout,
+                    title: title,
+                    metadataHash: bytes32(0),
+                    bountyToken: address(0),
+                    bountyPayout: 0,
+                    requiresApplication: false
+                });
+            }
+
+            function _projectSpent(bytes32 pid) internal view returns (uint128 spent) {
+                bytes memory result =
+                    lens.getStorage(address(tm), TaskManagerLens.StorageKey.PROJECT_INFO, abi.encode(pid));
+                (, uint128 s,) = abi.decode(result, (uint128, uint128, bool));
+                spent = s;
+            }
+
+            function _bountySpent(bytes32 pid, address tok) internal view returns (uint128 spent) {
+                bytes memory result =
+                    lens.getStorage(address(tm), TaskManagerLens.StorageKey.BOUNTY_BUDGET, abi.encode(pid, tok));
+                (, uint128 s) = abi.decode(result, (uint128, uint128));
+                spent = s;
+            }
+
+            function _taskProjectId(uint256 id) internal view returns (bytes32 projectId) {
+                bytes memory result = lens.getStorage(address(tm), TaskManagerLens.StorageKey.TASK_INFO, abi.encode(id));
+                (,,, bytes32 pid,) = abi.decode(result, (uint256, TaskManager.Status, address, bytes32, bool));
+                projectId = pid;
+            }
+
+            /*───────────────── HAPPY PATHS ─────────────────*/
+
+            function test_CreateTasksBatch_HappyPath_FiveTasks() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](5);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(2 ether, bytes("b"));
+                inputs[2] = _mkInput(3 ether, bytes("c"));
+                inputs[3] = _mkInput(4 ether, bytes("d"));
+                inputs[4] = _mkInput(5 ether, bytes("e"));
+
+                vm.prank(creator1);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                assertEq(ids.length, 5, "should return five ids");
+                for (uint256 i; i < 5; ++i) {
+                    assertEq(ids[i], i, "ids should be sequential from 0");
+                    assertEq(_taskProjectId(ids[i]), PID, "task should belong to PID");
+                }
+                assertEq(_projectSpent(PID), 15 ether, "spent should equal sum of payouts");
+            }
+
+            function test_CreateTasksBatch_EmitsTaskCreatedPerTask() public {
+                // Bind expected ids to a prior task so any reordering bug surfaces
+                // (without the seed, ids and loop indices coincidentally match starting at 0).
+                vm.prank(creator1);
+                tm.createTask(1 ether, bytes("seed"), bytes32(0), PID, address(0), 0, false);
+
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](3);
+                inputs[0] = _mkInput(1 ether, bytes("title-a"));
+                inputs[1] = _mkInput(2 ether, bytes("title-b"));
+                inputs[2] = _mkInput(3 ether, bytes("title-c"));
+
+                for (uint256 i; i < 3; ++i) {
+                    vm.expectEmit(true, true, false, true, address(tm));
+                    emit TaskManager.TaskCreated(
+                        i + 1, PID, inputs[i].payout, address(0), 0, false, inputs[i].title, bytes32(0)
+                    );
+                }
+
+                vm.prank(creator1);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                for (uint256 i; i < 3; ++i) {
+                    assertEq(ids[i], i + 1, "returned id must match emitted event id");
+                }
+            }
+
+            function test_CreateTasksBatch_MixedRequiresApplicationFlag() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](3);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("open"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(0),
+                    bountyPayout: 0,
+                    requiresApplication: true
+                });
+                inputs[1] = _mkInput(1 ether, bytes("claimable"));
+                inputs[2] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("open-2"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(0),
+                    bountyPayout: 0,
+                    requiresApplication: true
+                });
+
+                vm.prank(creator1);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                bytes memory r0 = lens.getStorage(address(tm), TaskManagerLens.StorageKey.TASK_INFO, abi.encode(ids[0]));
+                bytes memory r1 = lens.getStorage(address(tm), TaskManagerLens.StorageKey.TASK_INFO, abi.encode(ids[1]));
+                bytes memory r2 = lens.getStorage(address(tm), TaskManagerLens.StorageKey.TASK_INFO, abi.encode(ids[2]));
+                (,,,, bool ra0) = abi.decode(r0, (uint256, TaskManager.Status, address, bytes32, bool));
+                (,,,, bool ra1) = abi.decode(r1, (uint256, TaskManager.Status, address, bytes32, bool));
+                (,,,, bool ra2) = abi.decode(r2, (uint256, TaskManager.Status, address, bytes32, bool));
+                assertTrue(ra0, "task 0 should require application");
+                assertFalse(ra1, "task 1 should be directly claimable");
+                assertTrue(ra2, "task 2 should require application");
+
+                // Sanity end-to-end: directly-claimable task can be claimed; application-required cannot.
+                vm.prank(member1);
+                tm.claimTask(ids[1]);
+                vm.prank(member1);
+                vm.expectRevert(TaskManager.RequiresApplication.selector);
+                tm.claimTask(ids[0]);
+            }
+
+            function test_CreateTasksBatch_WithBountyTokens() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](2);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("bounty-a"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 1 ether,
+                    requiresApplication: false
+                });
+                inputs[1] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("bounty-b"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 2 ether,
+                    requiresApplication: false
+                });
+
+                vm.prank(creator1);
+                tm.createTasksBatch(BOUNTY_PID, inputs);
+
+                assertEq(_projectSpent(BOUNTY_PID), 2 ether, "PT spent should accumulate");
+                assertEq(_bountySpent(BOUNTY_PID, address(bountyToken)), 3 ether, "bounty spent should accumulate");
+            }
+
+            function test_CreateTasksBatch_MixedBountyAndNonBounty() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](3);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("with-bounty"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 2 ether,
+                    requiresApplication: false
+                });
+                inputs[1] = _mkInput(1 ether, bytes("plain"));
+                inputs[2] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("with-bounty-2"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 1 ether,
+                    requiresApplication: false
+                });
+
+                vm.prank(creator1);
+                tm.createTasksBatch(BOUNTY_PID, inputs);
+
+                assertEq(_bountySpent(BOUNTY_PID, address(bountyToken)), 3 ether, "only bounty tasks count");
+            }
+
+            function test_CreateTasksBatch_IdsContinueAfterPriorCreate() public {
+                vm.prank(creator1);
+                tm.createTask(1 ether, bytes("first"), bytes32(0), PID, address(0), 0, false);
+
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](3);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(1 ether, bytes("b"));
+                inputs[2] = _mkInput(1 ether, bytes("c"));
+
+                vm.prank(creator1);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                assertEq(ids[0], 1, "should continue after prior id 0");
+                assertEq(ids[1], 2);
+                assertEq(ids[2], 3);
+            }
+
+            function test_CreateTasksBatch_ExecutorCanCall() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](2);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(1 ether, bytes("b"));
+
+                vm.prank(executor);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                assertEq(ids.length, 2);
+            }
+
+            function test_CreateTasksBatch_ProjectManagerCanCall() public {
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_MANAGER, abi.encode(PID, pm1, true));
+
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](2);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(1 ether, bytes("b"));
+
+                vm.prank(pm1);
+                uint256[] memory ids = tm.createTasksBatch(PID, inputs);
+
+                assertEq(ids.length, 2);
+            }
+
+            /*───────────────── REVERTS ─────────────────*/
+
+            function test_RevertWhen_CreateTasksBatch_Empty() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](0);
+                vm.prank(creator1);
+                vm.expectRevert(TaskManager.EmptyBatch.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_NoPermission() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+
+                vm.prank(outsider);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_ProjectNotFound() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+
+                // Executor bypasses permission via _isPM, then hits NotFound inside _createTask.
+                vm.prank(executor);
+                vm.expectRevert(TaskManager.NotFound.selector);
+                tm.createTasksBatch(bytes32("does-not-exist"), inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_ZeroPayout() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](2);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(0, bytes("zero-payout"));
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.InvalidPayout.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_EmptyTitle() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = _mkInput(1 ether, bytes(""));
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.EmptyTitle.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_TitleTooLong() public {
+                bytes memory longTitle = new bytes(257);
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = _mkInput(1 ether, longTitle);
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.TitleTooLong.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_PayoutOverflow() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = _mkInput(1e24 + 1, bytes("too-big"));
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.InvalidPayout.selector);
+                tm.createTasksBatch(PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_ExceedsProjectCap() public {
+                bytes32 cappedPid = _createDefaultProject("CAPPED_BATCH", 2 ether);
+
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](3);
+                inputs[0] = _mkInput(1 ether, bytes("a"));
+                inputs[1] = _mkInput(1 ether, bytes("b"));
+                inputs[2] = _mkInput(1, bytes("over"));
+
+                vm.prank(creator1);
+                vm.expectRevert(BudgetLib.BudgetExceeded.selector);
+                tm.createTasksBatch(cappedPid, inputs);
+
+                // Atomicity: nothing should have been written.
+                assertEq(_projectSpent(cappedPid), 0, "spent must be unchanged after revert");
+            }
+
+            function test_RevertWhen_CreateTasksBatch_ExceedsBountyCap() public {
+                // BOUNTY_PID has bounty cap of 5 ether.
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](2);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("a"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 4 ether,
+                    requiresApplication: false
+                });
+                inputs[1] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("b"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 2 ether,
+                    requiresApplication: false
+                });
+
+                vm.prank(creator1);
+                vm.expectRevert(BudgetLib.BudgetExceeded.selector);
+                tm.createTasksBatch(BOUNTY_PID, inputs);
+
+                assertEq(_bountySpent(BOUNTY_PID, address(bountyToken)), 0, "bounty spent must roll back");
+                assertEq(_projectSpent(BOUNTY_PID), 0, "PT spent must roll back");
+            }
+
+            function test_RevertWhen_CreateTasksBatch_BadBountyConfig_TokenZeroPayoutPositive() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("bad"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(0),
+                    bountyPayout: 1 ether,
+                    requiresApplication: false
+                });
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.ZeroAddress.selector);
+                tm.createTasksBatch(BOUNTY_PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_BadBountyConfig_TokenSetPayoutZero() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](1);
+                inputs[0] = TaskManager.CreateTaskInput({
+                    payout: 1 ether,
+                    title: bytes("bad"),
+                    metadataHash: bytes32(0),
+                    bountyToken: address(bountyToken),
+                    bountyPayout: 0,
+                    requiresApplication: false
+                });
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.InvalidPayout.selector);
+                tm.createTasksBatch(BOUNTY_PID, inputs);
+            }
+
+            function test_RevertWhen_CreateTasksBatch_AtomicityOnLastFailure() public {
+                TaskManager.CreateTaskInput[] memory inputs = new TaskManager.CreateTaskInput[](6);
+                for (uint256 i; i < 5; ++i) {
+                    inputs[i] = _mkInput(1 ether, bytes("ok"));
+                }
+                inputs[5] = _mkInput(0, bytes("bad")); // zero payout reverts
+
+                vm.prank(creator1);
+                vm.expectRevert(ValidationLib.InvalidPayout.selector);
+                tm.createTasksBatch(PID, inputs);
+
+                assertEq(_projectSpent(PID), 0, "spent must be unchanged after atomic revert");
+
+                // nextTaskId atomicity: a fresh task after the failed batch must get id 0,
+                // proving the counter never advanced inside the reverted loop.
+                vm.prank(creator1);
+                tm.createTask(1 ether, bytes("post-revert"), bytes32(0), PID, address(0), 0, false);
+                bytes memory result = lens.getStorage(address(tm), TaskManagerLens.StorageKey.TASK_INFO, abi.encode(0));
+                (,,, bytes32 projectId,) = abi.decode(result, (uint256, TaskManager.Status, address, bytes32, bool));
+                assertEq(projectId, PID, "id 0 must be the post-revert task: counter did not advance");
+            }
+        }

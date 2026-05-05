@@ -43,6 +43,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
     error InvalidIndex();
     error SelfReviewNotAllowed();
     error ArrayLengthMismatch();
+    error EmptyBatch();
 
     /*──────── Constants ─────*/
     bytes4 public constant MODULE_ID = 0x54534b32; // "TSK2"
@@ -106,6 +107,15 @@ contract TaskManager is Initializable, ContextUpgradeable {
 
     struct BootstrapTaskConfig {
         uint8 projectIndex; // References project in same batch (0 for first project)
+        uint256 payout;
+        bytes title;
+        bytes32 metadataHash;
+        address bountyToken;
+        uint256 bountyPayout;
+        bool requiresApplication;
+    }
+
+    struct CreateTaskInput {
         uint256 payout;
         bytes title;
         bytes32 metadataHash;
@@ -434,6 +444,36 @@ contract TaskManager is Initializable, ContextUpgradeable {
         _createTask(payout, title, metadataHash, pid, requiresApplication, bountyToken, bountyPayout);
     }
 
+    /**
+     * @notice Create multiple tasks in a single project in one transaction.
+     * @dev Permission is checked once for the whole batch; project existence and
+     *      per-task validation still run inside `_createTask`. All-or-nothing:
+     *      any failure reverts the entire call.
+     * @param pid    Project ID all tasks will be created under.
+     * @param tasks  Array of task configurations, in the order they should be created.
+     * @return taskIds IDs of the newly-created tasks, in the same order as `tasks`.
+     */
+    function createTasksBatch(bytes32 pid, CreateTaskInput[] calldata tasks)
+        external
+        returns (uint256[] memory taskIds)
+    {
+        if (tasks.length == 0) revert EmptyBatch();
+        _requireCanCreate(pid);
+
+        uint256 len = tasks.length;
+        taskIds = new uint256[](len);
+
+        for (uint256 i; i < len;) {
+            CreateTaskInput calldata t = tasks[i];
+            taskIds[i] = _createTask(
+                t.payout, t.title, t.metadataHash, pid, t.requiresApplication, t.bountyToken, t.bountyPayout
+            );
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
     function _createTask(
         uint256 payout,
         bytes calldata title,
@@ -442,7 +482,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
         bool requiresApplication,
         address bountyToken,
         uint256 bountyPayout
-    ) internal {
+    ) internal returns (uint48 id) {
         Layout storage l = _layout();
         ValidationLib.requireValidTitle(title);
         ValidationLib.requireValidPayout96(payout);
@@ -463,7 +503,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
             bb.addSpent(bountyPayout);
         }
 
-        uint48 id = l.nextTaskId++;
+        id = l.nextTaskId++;
         l._tasks[id] = Task(
             pid, uint96(payout), address(0), uint96(bountyPayout), requiresApplication, Status.UNCLAIMED, bountyToken
         );

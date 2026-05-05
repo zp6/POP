@@ -42,7 +42,10 @@ base-llama = "https://base.llamarpc.com"
 base-public = "https://mainnet.base.org"
 arbitrum = "https://arb1.arbitrum.io/rpc"
 polygon = "https://polygon.drpc.org"
-gnosis = "https://gnosis.drpc.org"
+gnosis = "https://rpc.gnosischain.com"
+gnosis-drpc = "https://gnosis.drpc.org"
+gnosis-ankr = "https://rpc.ankr.com/gnosis"
+gnosis-gateway = "https://rpc.gnosis.gateway.fm"
 
 # Local development
 local = "http://localhost:8545"
