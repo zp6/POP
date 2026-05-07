@@ -867,8 +867,8 @@ contract OrgDeployer is Initializable {
         pure
         returns (address[] memory targets, bytes4[] memory selectors, bool[] memory allowed, uint32[] memory gasHints)
     {
-        // Count: QuickJoin(6) + TaskManager(12) + HybridVoting(3) + DDVoting(3) + PaymentManager(5) + EligibilityModule(5) + ParticipationToken(3) + Registry(2) + EducationHub(0 or 4)
-        uint256 count = 39;
+        // Count: QuickJoin(6) + TaskManager(13) + HybridVoting(3) + DDVoting(3) + PaymentManager(5) + EligibilityModule(5) + ParticipationToken(3) + Registry(2) + EducationHub(0 or 4)
+        uint256 count = 40;
         if (educationEnabled) count += 4;
 
         targets = new address[](count);
@@ -943,6 +943,9 @@ contract OrgDeployer is Initializable {
     {
         targets[i] = tm;
         selectors[i] = bytes4(keccak256("createTask(uint256,bytes,bytes32,bytes32,address,uint256,bool)"));
+        i++;
+        targets[i] = tm;
+        selectors[i] = bytes4(keccak256("createTasksBatch(bytes32,(uint256,bytes,bytes32,address,uint256,bool)[])"));
         i++;
         targets[i] = tm;
         selectors[i] = bytes4(keccak256("claimTask(uint256)"));

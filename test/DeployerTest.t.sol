@@ -5461,11 +5461,16 @@ contract DeployerTest is Test, IEligibilityModuleEvents {
             "registerAndQuickJoinWithPasskey selector mismatch"
         );
 
-        // ── TaskManager (9) ──
+        // ── TaskManager (10) ──
         assertEq(
             bytes4(keccak256("createTask(uint256,bytes,bytes32,bytes32,address,uint256,bool)")),
             TaskManager.createTask.selector,
             "createTask selector mismatch"
+        );
+        assertEq(
+            bytes4(keccak256("createTasksBatch(bytes32,(uint256,bytes,bytes32,address,uint256,bool)[])")),
+            TaskManager.createTasksBatch.selector,
+            "createTasksBatch selector mismatch"
         );
         assertEq(bytes4(keccak256("claimTask(uint256)")), TaskManager.claimTask.selector, "claimTask selector mismatch");
         assertEq(

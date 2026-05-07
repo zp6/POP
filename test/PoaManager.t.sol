@@ -9,8 +9,7 @@ import "../src/ImplementationRegistry.sol";
 
 contract DummyImpl {
     // Mock implementation for testing
-
-    }
+}
 
 /// @dev Mock target that gates a function behind msg.sender == poaManager
 contract MockAdminTarget {
