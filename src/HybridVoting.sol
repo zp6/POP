@@ -53,7 +53,10 @@ contract HybridVoting is Initializable {
         mapping(uint256 => bool) pollHatAllowed; // O(1) lookup for poll hat permission
         ClassConfig[] classesSnapshot; // Snapshot the class config to freeze semantics for this proposal
         bool executed; // finalization guard
-        uint32 voterCount; // number of voters who cast a vote
+        uint32 voterCount; // unique voter count (consumed by async-majority early-close threshold)
+        // Async-majority snapshot: 0 = legacy timer-only; type(uint64).max = explicit
+        // timer-only opt-out; otherwise max(callerHint, on-chain hatSupply sum).
+        uint64 snapshotEligibleVoters;
     }
 
     /* ─────── ERC-7201 Storage ─────── */
@@ -252,6 +255,15 @@ contract HybridVoting is Initializable {
         _;
     }
 
+    /// announceWinner gate: passes if timer has expired OR async-majority
+    /// early-close threshold is met. Replaces the timer-only isExpired
+    /// modifier; legacy proposals (snapshotEligibleVoters == 0) revert
+    /// here when timer is unexpired and continue to use the timer path.
+    modifier isExpiredOrEarlyClose(uint256 id) {
+        _checkExpiredOrEarlyClose(id);
+        _;
+    }
+
     function _checkCreator() private view {
         Layout storage l = _layout();
         if (_msgSender() != address(l.executor)) {
@@ -266,6 +278,23 @@ contract HybridVoting is Initializable {
 
     function _checkExpired(uint256 id) private view {
         if (block.timestamp <= _layout()._proposals[id].endTimestamp) revert VotingErrors.VotingOpen();
+    }
+
+    function _checkExpiredOrEarlyClose(uint256 id) private view {
+        if (block.timestamp <= _layout()._proposals[id].endTimestamp) {
+            if (!HybridVotingCore._isEarlyCloseEligible(id)) {
+                revert VotingErrors.VotingOpen();
+            }
+        }
+    }
+
+    /// Off-chain helper: returns whether a proposal currently meets the
+    /// async-majority early-close threshold without forcing the announceWinner
+    /// state transition. Indexers / clients can poll this view to surface
+    /// early-close-ready proposals.
+    function isEarlyCloseEligible(uint256 id) external view returns (bool) {
+        if (id >= _layout()._proposals.length) return false;
+        return HybridVotingCore._isEarlyCloseEligible(id);
     }
 
     /* ─────── Proposal creation ─────── */
@@ -289,7 +318,7 @@ contract HybridVoting is Initializable {
     function announceWinner(uint256 id)
         external
         exists(id)
-        isExpired(id)
+        isExpiredOrEarlyClose(id)
         whenNotPaused
         returns (uint256 winner, bool valid)
     {
