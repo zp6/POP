@@ -79,6 +79,43 @@
 - Slither runs in CI — fails on `high` severity; `arbitrary-send-eth` detector excluded (see `slither.config.json`)
 - Upgrade safety validated in CI against `upgrades/baseline` storage layouts
 
+## Forge scripts — simulate before declaring done
+
+Any new forge script that mutates on-chain state (`Hub.adminCall`, `Hub.adminCallCrossChain`, `Satellite.adminCall`, beacon upgrades, `setRulesBatch`, etc.) must be simulated against a real RPC fork before being called complete. `forge build` + a unit test selector check is **not** enough — transport/permission/struct-decoding bugs only show up against live state.
+
+**Required setup for every new mutating script:**
+
+1. Pair every `BroadcastX` contract with a `SimX` sibling that exercises the exact same call path under `vm.prank(<actual on-chain admin>)`.
+2. The admin EOA for Hub / Satellite / paymaster admin calls is **`0xA6F4D9f44Dd980b7168D829d5f74c2b00a46b2c9`** (Hudson). Owners of `PoaManagerHub` (Arbitrum) and `PoaManagerSatellite` (Gnosis) are this address — prank as it, don't read `Hub.owner()` and reuse the result, in case ownership ever changes mid-fork.
+3. Sims must call `getRule` / `getCurrentImplementationById` / etc. **before and after** the mutation and `require()` the expected change. Don't trust events alone — match the actual return type of the read function (e.g. PaymasterHub's `getRule` returns `Rule { uint32 maxCallGasHint; bool allowed }`, in that field order — decoding it as `(bool, uint32)` silently swaps the values).
+4. For cross-chain state (Hub on Arbitrum dispatching to Gnosis Satellite), prefer running on the destination chain via `Satellite.adminCall` over Hyperlane'd `adminCallCrossChain` — same destination effect, no 0.005 ETH fee, no 5-min relay wait. Cross-chain dispatch is also ~impossible to fully simulate locally.
+5. Run the sim end-to-end and confirm `PASS` output before writing any "ready to broadcast" message:
+   ```sh
+   forge script <path>:SimX --fork-url <chain> -vvv
+   ```
+6. Production profile (`FOUNDRY_PROFILE=production`) on this branch currently has a pre-existing `Stack too deep` issue independent of any single script — default profile is the one that has to compile cleanly for every change.
+
+## Subgraph (live deployment lookups)
+
+When you need to find an org's deployed contract addresses (TaskManager, Executor, QuickJoin, etc.), query the Poa subgraph rather than spelunking on-chain. It's the canonical source for `(orgId → contracts)` and is faster than fork-querying OrgRegistry.
+
+- **Gnosis** endpoint: `https://api.studio.thegraph.com/query/73367/poa-gnosis-v-1/version/latest`
+- **Arbitrum** endpoint: `https://api.studio.thegraph.com/query/73367/poa-arb-v-1/version/latest`
+- Schema: https://github.com/poa-box/subgraph-pop/blob/main/pop-subgraph/schema.graphql
+- Manifest (chain network names + start blocks): https://github.com/poa-box/subgraph-pop/blob/main/pop-subgraph/subgraph.yaml
+
+Each chain runs its own subgraph — Poa governance lives on Arbitrum, KUBI/Test6/etc. on Gnosis. Query the chain where the org was deployed.
+
+Quick recipe — find an org's TaskManager + Executor + QuickJoin from its `orgId`:
+
+```bash
+curl -s -X POST 'https://api.studio.thegraph.com/query/73367/poa-arb-v-1/version/latest' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ organization(id: \"0xa71879ef0e38b15fe7080196c0102f859e0ca8e7b8c0703ec8df03c66befd069\") { name taskManager { id } executorContract { id } quickJoin { id } } }"}'
+```
+
+Useful root entities: `Organization`, `TaskManager`, `Project`, `Task`, `User`, `RegisteredContract`, `GovernanceModule`. The `Organization` entity links to every per-org contract via fields like `executorContract`, `hybridVoting`, `directDemocracyVoting`, `quickJoin`, `participationToken`, `taskManager`, `educationHub`, `paymentManager`, `eligibilityModule`, `toggleModuleContract` — each is the proxy address.
+
 ## References
 
 - `docs/POP_OVERVIEW.md` — full protocol architecture and use cases
