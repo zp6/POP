@@ -309,6 +309,38 @@ contract HybridVoting is Initializable {
         HybridVotingProposals.createProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds);
     }
 
+    /// Task #441: caller can over-count eligibleVoters for safety; contract
+    /// enforces max(callerHint, _eligibleVotersUpperBound(hatIds)). Caller
+    /// can never under-count below on-chain truth.
+    function createProposalWithEligibleSnapshot(
+        bytes calldata title,
+        bytes32 descriptionHash,
+        uint32 minutesDuration,
+        uint8 numOptions,
+        IExecutor.Call[][] calldata batches,
+        uint256[] calldata hatIds,
+        uint64 callerEligibleHint
+    ) external onlyCreator whenNotPaused {
+        HybridVotingProposals.createProposalWithEligibleSnapshot(
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, callerEligibleHint
+        );
+    }
+
+    /// Task #441: explicit opt-out — proposal stays timer-only regardless of
+    /// vote counts. Useful for sprint-priority proposals wanting full window.
+    function createProposalLegacyTimerOnly(
+        bytes calldata title,
+        bytes32 descriptionHash,
+        uint32 minutesDuration,
+        uint8 numOptions,
+        IExecutor.Call[][] calldata batches,
+        uint256[] calldata hatIds
+    ) external onlyCreator whenNotPaused {
+        HybridVotingProposals.createProposalLegacyTimerOnly(
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds
+        );
+    }
+
     /* ─────── Voting ─────── */
     function vote(uint256 id, uint8[] calldata idxs, uint8[] calldata weights) external exists(id) whenNotPaused {
         HybridVotingCore.vote(id, idxs, weights);
