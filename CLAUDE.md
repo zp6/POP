@@ -100,7 +100,7 @@ Any new forge script that mutates on-chain state (`Hub.adminCall`, `Hub.adminCal
 When you need to find an org's deployed contract addresses (TaskManager, Executor, QuickJoin, etc.), query the Poa subgraph rather than spelunking on-chain. It's the canonical source for `(orgId → contracts)` and is faster than fork-querying OrgRegistry.
 
 - **Gnosis** endpoint: `https://api.studio.thegraph.com/query/73367/poa-gnosis-v-1/version/latest`
-- **Arbitrum** endpoint: `https://api.studio.thegraph.com/query/73367/poa-arb-v-1/version/latest` *(note: chain prefix is `arb`, not `arbitrum`)*
+- **Arbitrum** endpoint: `https://api.studio.thegraph.com/query/73367/poa-arb-v-1/version/latest`
 - Schema: https://github.com/poa-box/subgraph-pop/blob/main/pop-subgraph/schema.graphql
 - Manifest (chain network names + start blocks): https://github.com/poa-box/subgraph-pop/blob/main/pop-subgraph/subgraph.yaml
 
