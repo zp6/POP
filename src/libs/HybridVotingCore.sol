@@ -59,6 +59,14 @@ library HybridVotingCore {
         // Validate weights
         VotingMath.validateWeights(VotingMath.Weights({idxs: idxs, weights: weights, optionsLen: p.options.length}));
 
+        // Effects-before-Interactions: flip hasVoted BEFORE any external call
+        // (IERC20.balanceOf inside _calculateClassPower can land on an
+        // attacker-controlled token contract). A re-entry into vote() here
+        // would now hit the AlreadyVoted check above and revert. Reverting
+        // the outer tx (e.g. via the zero-power check below) rolls hasVoted
+        // back atomically, so honest callers are unaffected.
+        p.hasVoted[voter] = true;
+
         // Calculate raw power for each class
         uint256 classCount = p.classesSnapshot.length;
         uint256[] memory classRawPowers = new uint256[](classCount);
@@ -112,7 +120,6 @@ library HybridVotingCore {
             }
         }
 
-        p.hasVoted[voter] = true;
         unchecked {
             p.voterCount++;
         }
