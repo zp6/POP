@@ -12,184 +12,195 @@ import "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {IExecutor} from "../src/Executor.sol";
 import {MockHats} from "./mocks/MockHats.sol";
 
-/// Malicious ERC20 used as a class.asset. balanceOf() re-enters vote() on
-/// the configured HybridVoting contract. Without the CEI fix the recursive
-/// call would slip past the AlreadyVoted check and double-count raw power.
-contract MaliciousERC20 is IERC20 {
-    string public name = "MAL";
-    string public symbol = "MAL";
+contract MockERC20RE is IERC20 {
+    string public name = "PT";
+    string public symbol = "PT";
     uint8 public decimals = 18;
-    mapping(address => uint256) public balanceOf_; // shadow to avoid recursion in normal balance reads
+    mapping(address => uint256) public override balanceOf;
     uint256 public override totalSupply;
 
-    HybridVoting public hv;
-    uint256 public targetProposalId;
-    bool public attackArmed;
-    uint256 public reentryCount;
-
-    function arm(HybridVoting _hv, uint256 _id) external {
-        hv = _hv;
-        targetProposalId = _id;
-        attackArmed = true;
+    function transfer(address to, uint256 amt) external returns (bool) {
+        balanceOf[msg.sender] -= amt;
+        balanceOf[to] += amt;
+        return true;
     }
 
-    function setBalance(address who, uint256 amt) external {
-        balanceOf_[who] += amt;
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        return false;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return false;
+    }
+
+    function allowance(address, address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function mint(address to, uint256 amt) external {
+        balanceOf[to] += amt;
         totalSupply += amt;
     }
+}
 
-    function balanceOf(address who) external view override returns (uint256) {
-        return balanceOf_[who];
-    }
+    contract MockExecutorRE is IExecutor {
+        Call[] public lastBatch;
+        uint256 public lastId;
 
-    /// non-view variant the attacker uses indirectly. The reentry path is
-    /// triggered when HybridVoting calls IERC20(class.asset).balanceOf during
-    /// _calculateClassPower; we override balanceOf above as `view`, so the
-    /// attack vector for this test is via a transfer hook executed pre-vote
-    /// instead. The vector vigil HB#607 cites is balanceOf calling back; in
-    /// Solidity ^0.8 a view function CAN re-enter another non-view function
-    /// because the EVM doesn't enforce view at runtime. We model that here.
-    function reenter(uint8 op, uint8 weight) external returns (bool) {
-        if (!attackArmed) return false;
-        attackArmed = false; // single-shot to avoid infinite recursion
-        reentryCount++;
-        uint8[] memory idx = new uint8[](1);
-        idx[0] = op;
-        uint8[] memory w = new uint8[](1);
-        w[0] = weight;
-        // Call vote() recursively. With CEI fix, the AlreadyVoted check
-        // inside the new vote() rejects this. Without the fix, raw power
-        // accumulates twice.
-        try hv.vote(targetProposalId, idx, w) {
-            return true;
-        } catch {
-            return false;
+        function execute(uint256 id, Call[] calldata batch) external {
+            lastId = id;
+            delete lastBatch;
+            for (uint256 i; i < batch.length; ++i) {
+                lastBatch.push(batch[i]);
+            }
         }
     }
 
-    function transfer(address, uint256) public pure override returns (bool) { return true; }
-    function transferFrom(address, address, uint256) public pure override returns (bool) { return true; }
-    function approve(address, uint256) public pure override returns (bool) { return true; }
-    function allowance(address, address) public pure override returns (uint256) { return 0; }
-}
+    /**
+     * CEI ordering property tests for HybridVoting.vote().
+     *
+     * Background: HybridVotingCore.vote() calls IERC20(cls.asset).balanceOf(voter)
+     * inside _calculateClassPower. cls.asset is configured via the executor-only
+     * `setClasses`, so direct injection of a malicious asset requires a passed
+     * governance proposal. The PR moves p.hasVoted[voter] = true to BEFORE that
+     * external call (Checks-Effects-Interactions ordering).
+     *
+     * The originally-cited attack — a malicious ERC20 whose balanceOf() re-enters
+     * vote() before hasVoted is set — is NOT exploitable today. Solidity emits
+     * STATICCALL when invoking a `view` function through IERC20, and the EVM
+     * enforces no-state-modification on the entire static-call subtree. The
+     * recursive vote() would revert because vote() writes storage.
+     *
+     * The CEI ordering remains correct hygiene for two reasons:
+     *   1. Forward-defense against future class strategies that might call a
+     *      non-view function on cls.asset (e.g. a "lock balance during vote"
+     *      pattern). Such a strategy would not run under STATICCALL and could
+     *      re-enter without the EVM blocking it.
+     *   2. Independent of any attack: the standard CEI pattern makes the
+     *      function's pre/post-conditions easier to reason about — by the time
+     *      any external code is invoked, all internal state updates from this
+     *      call are visible.
+     *
+     * This test file pins two observable properties guaranteed by the CEI
+     * ordering. We do NOT attempt to simulate the originally-cited attack,
+     * because the EVM physically prevents it under current Solidity.
+     */
+    contract HybridVotingReentrancyTest is Test {
+        address owner = vm.addr(1);
+        address alice = vm.addr(2);
+        address bob = vm.addr(3);
 
-contract MockExecutorRE is IExecutor {
-    Call[] public lastBatch;
-    uint256 public lastId;
-    function execute(uint256 id, Call[] calldata batch) external {
-        lastId = id;
-        delete lastBatch;
-        for (uint256 i; i < batch.length; ++i) lastBatch.push(batch[i]);
+        MockERC20RE token;
+        MockHats hats;
+        MockExecutorRE exec;
+        HybridVoting hv;
+
+        uint256 constant DEFAULT_HAT_ID = 1;
+        uint256 constant CREATOR_HAT_ID = 3;
+
+        function setUp() public {
+            token = new MockERC20RE();
+            hats = new MockHats();
+            exec = new MockExecutorRE();
+
+            hats.mintHat(DEFAULT_HAT_ID, alice);
+            hats.mintHat(CREATOR_HAT_ID, alice);
+            hats.mintHat(DEFAULT_HAT_ID, bob);
+            hats.mintHat(CREATOR_HAT_ID, bob);
+
+            token.mint(alice, 100e18);
+            token.mint(bob, 100e18);
+
+            uint256[] memory votingHats = new uint256[](1);
+            votingHats[0] = DEFAULT_HAT_ID;
+            uint256[] memory creatorHats = new uint256[](1);
+            creatorHats[0] = CREATOR_HAT_ID;
+            address[] memory targets = new address[](1);
+            targets[0] = address(0xCA11);
+
+            HybridVoting.ClassConfig[] memory classes = new HybridVoting.ClassConfig[](1);
+            classes[0] = HybridVoting.ClassConfig({
+                strategy: HybridVoting.ClassStrategy.ERC20_BAL,
+                slicePct: 100,
+                quadratic: false,
+                minBalance: 1 ether,
+                asset: address(token),
+                hatIds: votingHats
+            });
+
+            bytes memory initData = abi.encodeCall(
+                HybridVoting.initialize, (address(hats), address(exec), creatorHats, targets, uint8(50), classes)
+            );
+
+            HybridVoting impl = new HybridVoting();
+            UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), owner);
+            BeaconProxy proxy = new BeaconProxy(address(beacon), initData);
+            hv = HybridVoting(payable(address(proxy)));
+
+            IExecutor.Call[][] memory batches = new IExecutor.Call[][](2);
+            batches[0] = new IExecutor.Call[](0);
+            batches[1] = new IExecutor.Call[](0);
+            vm.prank(alice);
+            hv.createProposal("CEI Test", bytes32(0), 60, 2, batches, new uint256[](0));
+        }
+
+        function _vote(address voter, uint8 option) internal {
+            uint8[] memory idx = new uint8[](1);
+            idx[0] = option;
+            uint8[] memory w = new uint8[](1);
+            w[0] = 100;
+            vm.prank(voter);
+            hv.vote(0, idx, w);
+        }
+
+        /// Property 1: A successful vote() sets hasVoted to true atomically and
+        /// reject all subsequent votes from the same voter with AlreadyVoted.
+        /// This is the post-condition the CEI ordering guarantees regardless of
+        /// what happens inside _calculateClassPower's external calls.
+        function test_CEI_voteSetsHasVotedAtomically_subsequentVoteReverts() public {
+            _vote(alice, 0);
+
+            // Second vote attempt from same voter must revert with AlreadyVoted.
+            uint8[] memory idx = new uint8[](1);
+            idx[0] = 1;
+            uint8[] memory w = new uint8[](1);
+            w[0] = 100;
+            vm.prank(alice);
+            vm.expectRevert(VotingErrors.AlreadyVoted.selector);
+            hv.vote(0, idx, w);
+        }
+
+        /// Property 2: If a vote() call reverts (e.g. via the zero-power check),
+        /// the EVM atomically rolls back the hasVoted=true flag set earlier in
+        /// the call. The voter remains eligible to retry. This is a property of
+        /// EVM atomicity but is critical to the CEI ordering being safe — without
+        /// rollback, the early hasVoted=true flip would permanently lock out
+        /// voters whose votes happened to revert.
+        function test_CEI_revertedVoteRollsBackHasVoted() public {
+            // Construct a scenario where the first vote attempt reverts:
+            // alice's balance is below minBalance for a transient moment.
+            // Easiest path: drain alice's balance so balanceOf returns 0, which
+            // triggers the no-power revert (Unauthorized) inside vote().
+            vm.prank(alice);
+            token.transfer(bob, 100e18);
+
+            // Alice attempts to vote with no balance → reverts on no-power check.
+            uint8[] memory idx = new uint8[](1);
+            idx[0] = 0;
+            uint8[] memory w = new uint8[](1);
+            w[0] = 100;
+            vm.prank(alice);
+            vm.expectRevert(VotingErrors.Unauthorized.selector);
+            hv.vote(0, idx, w);
+
+            // Restore alice's balance.
+            vm.prank(bob);
+            token.transfer(alice, 100e18);
+
+            // Alice can now vote successfully — the earlier hasVoted=true was
+            // rolled back by the revert. If CEI's early flip were sticky across
+            // reverts, this call would fail with AlreadyVoted.
+            vm.prank(alice);
+            hv.vote(0, idx, w);
+        }
     }
-}
-
-/**
- * Task #516 — verifies the CEI fix in HybridVotingCore.vote() blocks
- * reentrancy via the IERC20.balanceOf path that vigil HB#607 identified.
- *
- * The attack: a malicious ERC20 used as a class.asset has its balanceOf()
- * implementation re-enter vote() before the outer call sets hasVoted=true.
- * Pre-fix: re-entry double-counts the attacker's raw power. Post-fix:
- * re-entry hits the AlreadyVoted check at the top of vote() (because
- * hasVoted=true is set BEFORE the external call) and reverts.
- *
- * This is conditional on a malicious or compromised class.asset. setClasses
- * is onlyExecutor (governance-gated) so direct injection requires a passed
- * proposal, but defense-in-depth makes the attack impossible regardless of
- * who controlled the asset choice.
- */
-contract HybridVotingReentrancyTest is Test {
-    address owner = vm.addr(1);
-    address attacker = vm.addr(2);
-    address bystander = vm.addr(3);
-
-    MaliciousERC20 mal;
-    MockHats hats;
-    MockExecutorRE exec;
-    HybridVoting hv;
-
-    uint256 constant DEFAULT_HAT_ID = 1;
-    uint256 constant CREATOR_HAT_ID = 3;
-
-    function setUp() public {
-        mal = new MaliciousERC20();
-        hats = new MockHats();
-        exec = new MockExecutorRE();
-
-        hats.mintHat(DEFAULT_HAT_ID, attacker);
-        hats.mintHat(CREATOR_HAT_ID, attacker);
-        hats.mintHat(DEFAULT_HAT_ID, bystander);
-        hats.mintHat(CREATOR_HAT_ID, bystander);
-
-        mal.setBalance(attacker, 100e18);
-
-        uint256[] memory votingHats = new uint256[](1);
-        votingHats[0] = DEFAULT_HAT_ID;
-        uint256[] memory creatorHats = new uint256[](1);
-        creatorHats[0] = CREATOR_HAT_ID;
-        address[] memory targets = new address[](1);
-        targets[0] = address(0xCA11);
-
-        HybridVoting.ClassConfig[] memory classes = new HybridVoting.ClassConfig[](1);
-        classes[0] = HybridVoting.ClassConfig({
-            strategy: HybridVoting.ClassStrategy.ERC20_BAL,
-            slicePct: 100,
-            quadratic: false,
-            minBalance: 1 ether,
-            asset: address(mal), // <-- malicious asset; this would normally be set via governance proposal
-            hatIds: votingHats
-        });
-
-        bytes memory initData = abi.encodeCall(
-            HybridVoting.initialize,
-            (address(hats), address(exec), creatorHats, targets, uint8(50), classes)
-        );
-
-        HybridVoting impl = new HybridVoting();
-        UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), owner);
-        BeaconProxy proxy = new BeaconProxy(address(beacon), initData);
-        hv = HybridVoting(payable(address(proxy)));
-
-        // Create a proposal the attacker can vote on
-        IExecutor.Call[][] memory batches = new IExecutor.Call[][](2);
-        batches[0] = new IExecutor.Call[](0);
-        batches[1] = new IExecutor.Call[](0);
-        vm.prank(attacker);
-        hv.createProposal("Reentrancy victim", bytes32(0), 60, 2, batches, new uint256[](0));
-    }
-
-    /// CEI guard: when a malicious balanceOf re-enters vote() the recursion
-    /// MUST hit AlreadyVoted and revert, leaving the proposal's per-option
-    /// raw power tallied exactly once for the attacker. Verifies the fix
-    /// from Task #516.
-    function test_Reentrancy_voteCannotBeReentered() public {
-        // Arm the attack: malicious token's reenter() function will trigger
-        // a recursive vote on the SAME proposal. The malicious token's
-        // balanceOf() is `view` so it can't re-enter directly via Solidity
-        // view-call rules, but the attacker can simulate a real-world
-        // balanceOf-with-side-effect by calling reenter() directly from
-        // their account in the same tx as the vote.
-        mal.arm(hv, 0);
-
-        // Attacker tries to vote AND simultaneously trigger reenter() in
-        // the same tx. The reenter() call should attempt to call vote()
-        // recursively. With the CEI fix that recursion fails (AlreadyVoted).
-        uint8[] memory idx = new uint8[](1);
-        idx[0] = 0;
-        uint8[] memory w = new uint8[](1);
-        w[0] = 100;
-        vm.prank(attacker);
-        hv.vote(0, idx, w);
-
-        // Now invoke the reentry path manually (simulates a malicious
-        // ERC20 callback firing post-vote). Without the CEI fix the
-        // recursive vote would succeed and double-count. With the fix it
-        // reverts (catch-block returns false) and reentryCount stays
-        // accurately recorded.
-        vm.prank(attacker);
-        bool reentryWorked = mal.reenter(0, 100);
-
-        assertFalse(reentryWorked, "reentry should fail because vote() rejects AlreadyVoted");
-        assertEq(mal.reentryCount(), 1, "reenter() was invoked exactly once");
-    }
-}

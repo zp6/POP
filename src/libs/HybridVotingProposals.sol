@@ -72,7 +72,9 @@ library HybridVotingProposals {
         uint256[] calldata hatIds,
         uint64 callerEligibleHint
     ) external {
-        uint256 id = _initProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds, callerEligibleHint);
+        uint256 id = _initProposal(
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, callerEligibleHint
+        );
 
         uint64 endTs = _layout()._proposals[id].endTimestamp;
 
@@ -96,7 +98,9 @@ library HybridVotingProposals {
         IExecutor.Call[][] calldata batches,
         uint256[] calldata hatIds
     ) external {
-        uint256 id = _initProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds, type(uint64).max);
+        uint256 id = _initProposal(
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, type(uint64).max
+        );
 
         uint64 endTs = _layout()._proposals[id].endTimestamp;
 
@@ -180,47 +184,67 @@ library HybridVotingProposals {
         // opt-out sentinel; otherwise sum on-chain hatSupply across the
         // effective hat array (pollHatIds when restricted, creatorHatIds
         // when not) and take the max with the caller's hint.
+        //
+        // Edge case: if the proposal is unrestricted AND creatorHatIds is
+        // empty AND callerEligibleHint is 0, the snapshot resolves to 0,
+        // which the gate treats as legacy timer-only. This is intentional —
+        // with no on-chain hat supply to anchor "half of eligible voters",
+        // there is no principled basis for early-close, so the proposal
+        // falls through to the timer path. Callers wanting early-close in
+        // this configuration must pass a non-zero callerEligibleHint.
         if (callerEligibleHint == type(uint64).max) {
             p.snapshotEligibleVoters = type(uint64).max;
         } else {
-            uint256[] memory eligibleHatIds;
-            if (p.restricted) {
-                eligibleHatIds = new uint256[](hatIds.length);
-                for (uint256 i; i < hatIds.length;) {
-                    eligibleHatIds[i] = hatIds[i];
-                    unchecked { ++i; }
-                }
-            } else {
-                uint256 ccLen = l.creatorHatIds.length;
-                eligibleHatIds = new uint256[](ccLen);
-                for (uint256 i; i < ccLen;) {
-                    eligibleHatIds[i] = l.creatorHatIds[i];
-                    unchecked { ++i; }
-                }
-            }
-            uint64 onChainUpperBound = _eligibleVotersUpperBound(eligibleHatIds);
-            p.snapshotEligibleVoters = callerEligibleHint > onChainUpperBound
-                ? callerEligibleHint
-                : onChainUpperBound;
+            uint64 onChainUpperBound = p.restricted
+                ? _eligibleVotersUpperBoundCalldata(hatIds)
+                : _eligibleVotersUpperBoundStorage(l.creatorHatIds);
+            p.snapshotEligibleVoters = callerEligibleHint > onChainUpperBound ? callerEligibleHint : onChainUpperBound;
         }
 
         return id;
     }
 
-    /// Sum of IHats.hatSupply across hatIds, capped at uint64.max. Used at
-    /// createProposal to seed the early-close eligibility snapshot. NOTE:
-    /// addresses wearing multiple eligible hats are double-counted; this is
-    /// acceptable because over-counting raises the threshold (i.e. requires
-    /// more voters before early-close fires) which is the safer direction.
-    function _eligibleVotersUpperBound(uint256[] memory hatIds) internal view returns (uint64) {
+    /// Sum of IHats.hatSupply across a calldata hat array. Used when the
+    /// proposal is restricted and pollHatIds is the caller's calldata. See
+    /// _eligibleVotersUpperBoundStorage for the unrestricted (creatorHatIds)
+    /// path. Both share the clamp semantics described below.
+    function _eligibleVotersUpperBoundCalldata(uint256[] calldata hatIds) internal view returns (uint64) {
         HybridVoting.Layout storage l = _layout();
         uint256 total;
         uint256 len = hatIds.length;
         for (uint256 i; i < len;) {
             total += l.hats.hatSupply(hatIds[i]);
-            unchecked { ++i; }
+            unchecked {
+                ++i;
+            }
         }
-        return total > type(uint64).max ? type(uint64).max : uint64(total);
+        // Clamp to type(uint64).max - 1 so the value type(uint64).max remains
+        // exclusively the explicit timer-only opt-out sentinel. Overflow can
+        // only happen at astronomical hat supplies (> 1.8e19 across all
+        // hatIds), but reserving the sentinel keeps semantics unambiguous.
+        return total >= uint256(type(uint64).max) ? uint64(type(uint64).max - 1) : uint64(total);
+    }
+
+    /// Sum of IHats.hatSupply across a storage hat array. Used when the
+    /// proposal is unrestricted and the effective hat list is creatorHatIds
+    /// (already in HybridVoting storage). Avoids the calldata→memory copy
+    /// the original implementation needed to share a single helper.
+    ///
+    /// NOTE: addresses wearing multiple eligible hats are double-counted;
+    /// this is acceptable because over-counting raises the threshold (i.e.
+    /// requires more voters before early-close fires) which is the safer
+    /// direction.
+    function _eligibleVotersUpperBoundStorage(uint256[] storage hatIds) internal view returns (uint64) {
+        HybridVoting.Layout storage l = _layout();
+        uint256 total;
+        uint256 len = hatIds.length;
+        for (uint256 i; i < len;) {
+            total += l.hats.hatSupply(hatIds[i]);
+            unchecked {
+                ++i;
+            }
+        }
+        return total >= uint256(type(uint64).max) ? uint64(type(uint64).max - 1) : uint64(total);
     }
 
     function _validateDuration(uint32 minutesDuration) internal pure {

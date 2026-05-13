@@ -60,11 +60,16 @@ library HybridVotingCore {
         VotingMath.validateWeights(VotingMath.Weights({idxs: idxs, weights: weights, optionsLen: p.options.length}));
 
         // Effects-before-Interactions: flip hasVoted BEFORE any external call
-        // (IERC20.balanceOf inside _calculateClassPower can land on an
-        // attacker-controlled token contract). A re-entry into vote() here
-        // would now hit the AlreadyVoted check above and revert. Reverting
-        // the outer tx (e.g. via the zero-power check below) rolls hasVoted
-        // back atomically, so honest callers are unaffected.
+        // (IERC20.balanceOf inside _calculateClassPower can land on a token
+        // contract whose code we don't control). The cited balanceOf-callback
+        // attack vector is not exploitable today because Solidity emits
+        // STATICCALL for IERC20.balanceOf, which the EVM enforces no-state-
+        // modification on the entire call subtree. CEI ordering remains
+        // correct hygiene and forward-defense against future class strategies
+        // that use non-view calls on cls.asset. If the outer tx later reverts
+        // (e.g. via the zero-power check below), the EVM rolls hasVoted back
+        // atomically, so honest callers are unaffected. See
+        // test/HybridVotingReentrancy.t.sol for the property test.
         p.hasVoted[voter] = true;
 
         // Calculate raw power for each class
@@ -126,11 +131,28 @@ library HybridVotingCore {
         emit VoteCast(id, voter, idxs, weights, classRawPowers, uint64(block.timestamp));
     }
 
-    /// Async-majority early-close gate (Proposal #60). True iff turnout has
-    /// reached ceil(snapshotEligibleVoters/2) AND a single option holds strict
-    /// majority of total score. snapshotEligibleVoters of 0 (legacy proposals
-    /// pre-upgrade) or type(uint64).max (explicit timer-only opt-out at create
-    /// time) short-circuit to false.
+    /// Async-majority early-close gate (Proposal #60). Returns true iff
+    /// announceWinner could be called right now and would return
+    /// `valid == true` with a strict-majority winner.
+    ///
+    /// Conditions (all must hold):
+    ///   1. snapshotEligibleVoters is an active value (not 0 — legacy
+    ///      pre-upgrade proposals; not type(uint64).max — explicit
+    ///      timer-only opt-out).
+    ///   2. voterCount has reached ceil(snapshotEligibleVoters / 2).
+    ///   3. Quorum (if set) is satisfied. announceWinner enforces this
+    ///      internally; checking here avoids firing the gate on a path
+    ///      that would invalidate.
+    ///   4. The slice-weighted score for the leading option meets the
+    ///      same valid=true predicate that VotingMath.pickWinnerNSlices
+    ///      uses: hi >= thresholdPct * N_SLICE_PRECISION AND hi > second.
+    ///   5. PR #60's documented "strict majority" intent: the leading
+    ///      option holds > 50% of total slice-weighted score.
+    ///
+    /// Scoring mirrors VotingMath.pickWinnerNSlices line-for-line: for
+    /// each option, score is sum of (optRaw * slice * PRECISION) / classTotal
+    /// across classes (skipping classes with zero total). This guarantees
+    /// the gate predicts the same winner announceWinner picks.
     function _isEarlyCloseEligible(uint256 id) internal view returns (bool) {
         HybridVoting.Layout storage l = _layout();
         if (id >= l._proposals.length) return false;
@@ -141,23 +163,46 @@ library HybridVotingCore {
 
         uint64 threshold = (p.snapshotEligibleVoters + 1) / 2;
         if (p.voterCount < threshold) return false;
+        if (l.quorum > 0 && p.voterCount < l.quorum) return false;
 
+        uint256 numOptions = p.options.length;
+        uint256 numClasses = p.classesSnapshot.length;
+        if (numOptions == 0) return false;
+
+        uint256 hi;
+        uint256 second;
         uint256 totalScore;
-        uint256 winningScore;
-        uint256 optionCount = p.options.length;
-        uint256 classCount = p.classTotalsRaw.length;
-        for (uint256 opt; opt < optionCount;) {
+        for (uint256 opt; opt < numOptions;) {
             uint256 score;
-            for (uint256 cls; cls < classCount;) {
-                score += p.options[opt].classRaw[cls];
-                unchecked { ++cls; }
+            for (uint256 cls; cls < numClasses;) {
+                uint256 classTotal = p.classTotalsRaw[cls];
+                if (classTotal > 0) {
+                    score += (uint256(p.options[opt].classRaw[cls])
+                            * p.classesSnapshot[cls].slicePct
+                            * VotingMath.N_SLICE_PRECISION) / classTotal;
+                }
+                unchecked {
+                    ++cls;
+                }
             }
             totalScore += score;
-            if (score > winningScore) winningScore = score;
-            unchecked { ++opt; }
+            if (score > hi) {
+                second = hi;
+                hi = score;
+            } else if (score > second) {
+                second = score;
+            }
+            unchecked {
+                ++opt;
+            }
         }
 
-        return totalScore > 0 && winningScore * 2 > totalScore;
+        if (totalScore == 0) return false;
+
+        bool thresholdMet = hi >= uint256(l.thresholdPct) * VotingMath.N_SLICE_PRECISION;
+        bool strictMargin = hi > second;
+        bool strictMajority = hi * 2 > totalScore;
+        return thresholdMet && strictMargin && strictMajority;
     }
 
     function _calculateClassPower(address voter, HybridVoting.ClassConfig memory cls, HybridVoting.Layout storage l)
