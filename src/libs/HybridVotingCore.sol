@@ -59,17 +59,7 @@ library HybridVotingCore {
         // Validate weights
         VotingMath.validateWeights(VotingMath.Weights({idxs: idxs, weights: weights, optionsLen: p.options.length}));
 
-        // Effects-before-Interactions: flip hasVoted BEFORE any external call
-        // (IERC20.balanceOf inside _calculateClassPower can land on a token
-        // contract whose code we don't control). The cited balanceOf-callback
-        // attack vector is not exploitable today because Solidity emits
-        // STATICCALL for IERC20.balanceOf, which the EVM enforces no-state-
-        // modification on the entire call subtree. CEI ordering remains
-        // correct hygiene and forward-defense against future class strategies
-        // that use non-view calls on cls.asset. If the outer tx later reverts
-        // (e.g. via the zero-power check below), the EVM rolls hasVoted back
-        // atomically, so honest callers are unaffected. See
-        // test/HybridVotingReentrancy.t.sol for the property test.
+        // CEI: set hasVoted before the IERC20.balanceOf call below.
         p.hasVoted[voter] = true;
 
         // Calculate raw power for each class
@@ -131,31 +121,10 @@ library HybridVotingCore {
         emit VoteCast(id, voter, idxs, weights, classRawPowers, uint64(block.timestamp));
     }
 
-    /// Early-close gate (Proposal #60, redesigned). Returns true iff turnout
-    /// has reached the org-configured threshold AND the proposal-level quorum
-    /// (if set) is satisfied. No majority / score check at the gate —
-    /// announceWinner's existing winner-picking and validity logic remains
-    /// the final arbiter of who wins.
-    ///
-    /// Conditions (all must hold):
-    ///   1. snapshotEligibleVoters is an active value (not 0 — legacy
-    ///      pre-upgrade proposals stay timer-only; not type(uint64).max —
-    ///      explicit timer-only opt-out at create time).
-    ///   2. voterCount has reached ceil(snapshotEligibleVoters * pct / 100)
-    ///      where pct is the proposal's turnoutPctOverride if set, else the
-    ///      org-level earlyCloseTurnoutPct. Both 0 means 100 (safe default —
-    ///      strict full-turnout early-close).
-    ///   3. Quorum (if set) is satisfied — mirrors announceWinner's check so
-    ///      the gate doesn't fire on a path that would invalidate.
-    ///
-    /// Why no majority check: orgs choose their own turnout floor (100% means
-    /// "wait for everyone" — no disenfranchisement risk; lower values let the
-    /// org trade deliberation for speed at their discretion). A hardcoded
-    /// "strict majority" requirement on top would override the org's
-    /// configured trust model. If turnout is reached but no option has a valid
-    /// winner under thresholdPct / strict-margin rules, announceWinner returns
-    /// (0, false) — the gate is permission to attempt announce, not a
-    /// guarantee of validity.
+    /// Turnout-only gate. True iff voterCount has reached
+    /// ceil(snapshot * effectivePct / 100) and quorum (if set) is satisfied.
+    /// snapshot==0 means legacy pre-upgrade; snapshot==max means opt-out.
+    /// effectivePct: turnoutPctOverride if set, else org default; 0 -> 100.
     function _isEarlyCloseEligible(uint256 id) internal view returns (bool) {
         HybridVoting.Layout storage l = _layout();
         if (id >= l._proposals.length) return false;

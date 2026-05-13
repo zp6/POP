@@ -28,15 +28,7 @@ library HybridVotingProposals {
         uint256[] hatIds
     );
 
-    /// Emitted once per proposal creation alongside NewProposal/NewHatProposal.
-    /// Exposes the complete early-close config so indexers can determine, at
-    /// event-parse time:
-    ///   - whether the proposal can ever early-close (isTimerOnly == true means
-    ///     no — snapshot is the type(uint64).max opt-out sentinel)
-    ///   - the eligibility snapshot used as the threshold denominator
-    ///   - any per-proposal override of the org-level turnout percent
-    /// The effective turnout pct is `turnoutPctOverride` if non-zero, else the
-    /// current org default tracked by EarlyCloseTurnoutPctSet events.
+    /// Per-proposal early-close config. turnoutPctOverride==0 means use org default.
     event ProposalEarlyCloseConfig(
         uint256 indexed id, uint64 snapshotEligibleVoters, uint8 turnoutPctOverride, bool isTimerOnly
     );
@@ -70,18 +62,9 @@ library HybridVotingProposals {
         }
     }
 
-    /// Variant that lets the caller supply a higher eligibility hint than
-    /// on-chain truth. Useful when the proposer expects hats to be granted
-    /// (or transferred in) before the proposal closes and wants to keep the
-    /// early-close threshold conservative. The stored snapshot is
-    /// max(callerEligibleHint, on-chain hatSupply sum) — under-count is
-    /// impossible by construction; over-count makes early-close stricter.
-    ///
-    /// Special sentinel: passing `callerEligibleHint = type(uint64).max`
-    /// disables early-close entirely for this proposal — it must run its
-    /// full timer regardless of how many voters participate. Use this for
-    /// proposals where the duration itself is the policy (RFC windows,
-    /// mandatory deliberation periods, externally-coordinated timing).
+    /// Snapshot = max(callerEligibleHint, on-chain hatSupply sum). Caller can
+    /// only ratchet UP. Sentinel: callerEligibleHint == type(uint64).max
+    /// disables early-close entirely (timer-only opt-out).
     function createProposalWithEligibleSnapshot(
         bytes calldata title,
         bytes32 descriptionHash,
@@ -104,11 +87,7 @@ library HybridVotingProposals {
         }
     }
 
-    /// Variant that sets a per-proposal early-close turnout percent override.
-    /// The override must be in [orgDefault, 100] — callers can only ratchet
-    /// UP from the org's default (mirrors the under-count guard for snapshot
-    /// hints). Used for sensitive proposals (constitutional changes, large
-    /// treasury moves) where the proposer wants a stricter turnout floor.
+    /// Per-proposal turnout override in [orgDefault, 100]. Ratchet UP only.
     function createProposalWithTurnoutPct(
         bytes calldata title,
         bytes32 descriptionHash,
@@ -206,18 +185,8 @@ library HybridVotingProposals {
             }
         }
 
-        // Snapshot eligibility. type(uint64).max is the explicit timer-only
-        // opt-out sentinel; otherwise sum on-chain hatSupply across the
-        // effective hat array (pollHatIds when restricted, creatorHatIds
-        // when not) and take the max with the caller's hint.
-        //
-        // Edge case: if the proposal is unrestricted AND creatorHatIds is
-        // empty AND callerEligibleHint is 0, the snapshot resolves to 0,
-        // which the gate treats as legacy timer-only. This is intentional —
-        // with no on-chain hat supply to anchor "half of eligible voters",
-        // there is no principled basis for early-close, so the proposal
-        // falls through to the timer path. Callers wanting early-close in
-        // this configuration must pass a non-zero callerEligibleHint.
+        // type(uint64).max sentinel disables early-close. Empty hatIds list +
+        // hint==0 resolves to snapshot=0, which the gate treats as timer-only.
         if (callerEligibleHint == type(uint64).max) {
             p.snapshotEligibleVoters = type(uint64).max;
         } else {
@@ -238,10 +207,6 @@ library HybridVotingProposals {
         return id;
     }
 
-    /// Sum of IHats.hatSupply across a calldata hat array. Used when the
-    /// proposal is restricted and pollHatIds is the caller's calldata. See
-    /// _eligibleVotersUpperBoundStorage for the unrestricted (creatorHatIds)
-    /// path. Both share the clamp semantics described below.
     function _eligibleVotersUpperBoundCalldata(uint256[] calldata hatIds) internal view returns (uint64) {
         HybridVoting.Layout storage l = _layout();
         uint256 total;
@@ -252,22 +217,12 @@ library HybridVotingProposals {
                 ++i;
             }
         }
-        // Clamp to type(uint64).max - 1 so the value type(uint64).max remains
-        // exclusively the explicit timer-only opt-out sentinel. Overflow can
-        // only happen at astronomical hat supplies (> 1.8e19 across all
-        // hatIds), but reserving the sentinel keeps semantics unambiguous.
+        // Clamp to max-1; max is reserved as the timer-only sentinel.
         return total >= uint256(type(uint64).max) ? uint64(type(uint64).max - 1) : uint64(total);
     }
 
-    /// Sum of IHats.hatSupply across a storage hat array. Used when the
-    /// proposal is unrestricted and the effective hat list is creatorHatIds
-    /// (already in HybridVoting storage). Avoids the calldata→memory copy
-    /// the original implementation needed to share a single helper.
-    ///
-    /// NOTE: addresses wearing multiple eligible hats are double-counted;
-    /// this is acceptable because over-counting raises the threshold (i.e.
-    /// requires more voters before early-close fires) which is the safer
-    /// direction.
+    /// Note: overlapping-hat wearers are double-counted (safe direction:
+    /// over-counting raises the threshold).
     function _eligibleVotersUpperBoundStorage(uint256[] storage hatIds) internal view returns (uint64) {
         HybridVoting.Layout storage l = _layout();
         uint256 total;

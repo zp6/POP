@@ -65,25 +65,8 @@ contract MockERC20EC is IERC20 {
         }
     }
 
-    /**
-     * Task #441 — async-majority early-close integration tests.
-     *
-     * Three test groups:
-     *   A. Original PR coverage (tests 1-14): the 8 scenarios from the trilateral
-     *      design + 6 robustness scenarios. All use the 50/50-slice setUp `hv`.
-     *   B. Supplementary coverage (tests 15-26): pause, snapshot freeze, batch
-     *      execution, threshold=1, out-of-range, empty creator hats, transient
-     *      gate behavior, and the slice-weighted-vs-raw-sum scenario that
-     *      motivated the gate's switch to slice-weighted scoring.
-     *   C. New gate semantics (tests 27-29): quorum-blocks-gate, high-thresholdPct,
-     *      plurality-without-strict-majority, gate-matches-announceWinner invariant.
-     *
-     * Group B+C tests deploy their own HybridVoting proxy via `_deploy` so they
-     * can vary slicePct / thresholdPct / quorum without disturbing the shared
-     * `hv` instance used by Group A.
-     *
-     * Per Argus task #441 + Proposal #60 async-majority protocol (passed 3-0 HB#493).
-     */
+    /// Early-close integration tests. Group A uses the shared `hv` proxy from
+    /// setUp; group B/C tests deploy fresh proxies via `_deploy` to vary config.
     contract HybridVotingEarlyCloseTest is Test {
         address owner = vm.addr(1);
         address alice = vm.addr(2);
@@ -202,16 +185,11 @@ contract MockERC20EC is IERC20 {
             );
         }
 
+        // Opt out of early-close via the snapshot sentinel.
         function _createLegacyTimerOnly() internal {
-            // The dedicated `createProposalLegacyTimerOnly` was removed in this PR
-            // to save bytecode. The same opt-out is still reachable via the
-            // snapshot sentinel: passing type(uint64).max as the caller hint
-            // sets snapshotEligibleVoters to the opt-out value, so the gate
-            // can never fire.
-            bytes memory title = "Legacy Timer Only";
             vm.prank(alice);
             hv.createProposalWithEligibleSnapshot(
-                title, bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), type(uint64).max
+                "Legacy Timer Only", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), type(uint64).max
             );
         }
 
@@ -241,11 +219,6 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Scenario 3: threshold met but tied → gate fires; announceWinner returns invalid ─── */
 
-        /// Under the new turnout-only gate, a tied vote with turnout reached
-        /// still passes the gate (turnout doesn't care about score). The
-        /// validity check happens in announceWinner via pickWinnerNSlices,
-        /// which returns valid=false for a tie. So the call no longer reverts
-        /// — it returns (0, false) and the proposal is marked executed.
         function test_EarlyClose_thresholdMetButTied_announceReturnsInvalid() public {
             _createDefault();
             // 2 of 3 vote split 1-1 between YES and NO
@@ -317,14 +290,7 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Scenario 8: snapshotEligibleVoters == 0 (legacy back-compat) → timer-only ─── */
 
-        /// Exercises the legacy-back-compat gate by creating a proposal, then
-        /// zeroing snapshotEligibleVoters via vm.store to simulate a pre-upgrade
-        /// proposal (zero-init for new fields). This is the rigorous test for
-        /// the gate at HybridVotingCore._isEarlyCloseEligible:
-        ///   if (p.snapshotEligibleVoters == 0) return false;
-        /// Without this gate, post-upgrade announce paths would treat legacy
-        /// proposals as having a threshold of ceil(0/2)=0 — every vote would
-        /// trip early-close for a corpus of pre-upgrade proposals.
+        /// Zero snapshot (legacy zero-init) must short-circuit the gate.
         function test_EarlyClose_legacyBackCompat_zeroSnapshot_timerOnly() public {
             _createDefault();
             _voteYes(alice);
@@ -392,9 +358,7 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Additional robustness scenarios ─── */
 
-        /// Restricted-poll proposals snapshot from pollHatIds, not creatorHatIds.
-        /// Verifies the branching in _initProposal that picks the right hat
-        /// array for the on-chain snapshot computation.
+        /// Restricted proposals snapshot from pollHatIds, not creatorHatIds.
         function test_EarlyClose_restrictedPoll_snapshotFromPollHatIds() public {
             // Add a 4th wearer to the DEFAULT_HAT_ID so creator and poll counts diverge:
             // - creatorHatIds = [CREATOR_HAT_ID]; supply = 3 (alice/bob/carol)
@@ -420,8 +384,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hv.isEarlyCloseEligible(0));
         }
 
-        /// Boundary: even-N threshold rounds correctly. With N=4 eligible, we
-        /// need 2 voters (ceil(4/2) = 2), not 3.
         function test_EarlyClose_thresholdBoundary_evenEligibleSet() public {
             // 4 eligible via callerHint (skipping on-chain since fleet is 3)
             _createWithHint(4);
@@ -431,8 +393,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hv.isEarlyCloseEligible(0));
         }
 
-        /// Boundary: odd-N threshold rounds UP correctly. With N=5 eligible, we
-        /// need 3 voters (ceil(5/2)=3), not 2.
         function test_EarlyClose_thresholdBoundary_oddEligibleSet() public {
             _createWithHint(5);
             _voteYes(alice);
@@ -444,8 +404,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hv.isEarlyCloseEligible(0));
         }
 
-        /// Strict majority means winning > 50%, not winning >= 50%. With 3-way
-        /// split where one option has 51% and another 49%, the 51% option wins.
         function test_EarlyClose_strictMajority_narrowWinPasses() public {
             _createDefault();
             // Vote weights: alice 60% YES / 40% NO; bob 60% YES / 40% NO
@@ -466,9 +424,7 @@ contract MockERC20EC is IERC20 {
             assertTrue(ok);
         }
 
-        /// _eligibleVotersUpperBound double-counts when a single address wears
-        /// multiple eligible hats. Verifies the over-count is in the SAFE
-        /// direction (raises threshold, makes early-close harder).
+        /// Overlapping-hat over-count raises (not lowers) the threshold.
         function test_EarlyClose_overlappingHats_overcountIsSafeDirection() public {
             // Use callerHint=0 so contract uses on-chain truth across creatorHatIds=[CREATOR_HAT_ID].
             // alice/bob/carol each wear CREATOR_HAT_ID → supply=3 → threshold=2.
@@ -526,8 +482,6 @@ contract MockERC20EC is IERC20 {
 
         address constant DAVE = address(uint160(uint256(keccak256("dave"))));
 
-        /// Deploy a fresh HybridVoting proxy with the given config. Reuses the
-        /// hat layout from setUp (alice/bob/carol wearing CREATOR/EXECUTIVE/DEFAULT).
         function _deploy(uint8 ddSlice, uint8 ercSlice, uint8 thresholdPct_, uint32 quorum_)
             internal
             returns (HybridVoting hvOut)
@@ -535,9 +489,7 @@ contract MockERC20EC is IERC20 {
             return _deployWithTurnout(ddSlice, ercSlice, thresholdPct_, 50, quorum_);
         }
 
-        /// Same as `_deploy` but lets the test specify a custom org-default
-        /// early-close turnout percent. Default `_deploy` uses 50 to preserve
-        /// the pre-redesign ceil(N/2) semantics that most tests assume.
+        /// `_deploy` wraps with earlyCloseTurnoutPct=50 (matches pre-redesign turnout floor).
         function _deployWithTurnout(
             uint8 ddSlice,
             uint8 ercSlice,
@@ -605,7 +557,6 @@ contract MockERC20EC is IERC20 {
             target.vote(id, idx, w);
         }
 
-        /// Vote-with-weights variant for tests that need split-weight voting.
         function _voteWeighted(
             HybridVoting target,
             address voter,
@@ -619,11 +570,8 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Slice-weighted gate predicts the same winner announceWinner picks ─── */
 
-        /// Was T1 in HybridVotingEarlyCloseExtra. Pre-gate-fix, this scenario
-        /// exposed a divergence: raw-sum said NO leads (carol's whale balance
-        /// dominates), slice-weighted said YES leads (DD 90% slice, 2/3 chose
-        /// YES). The gate now uses slice-weighted scoring, so it agrees with
-        /// announceWinner.
+        /// Turnout-only gate fires once threshold met; whale-vs-DD outcome
+        /// is decided by announceWinner's slice-weighted pickWinnerNSlices.
         function test_EarlyClose_sliceWeightedGate_predictsAnnounceWinner() public {
             HybridVoting hvCustom = _deploy(90, 10, 50, 0);
 
@@ -655,10 +603,6 @@ contract MockERC20EC is IERC20 {
 
         /* ─── 3-option equal split: gate fires (turnout met); announceWinner returns invalid ─── */
 
-        /// Under the new turnout-only gate, a 3-way tie with full turnout still
-        /// passes the gate. announceWinner's pickWinnerNSlices is the validity
-        /// arbiter and returns (0, false) for the tied scenario (no option meets
-        /// the threshold AND has strict margin).
         function test_EarlyClose_threeOptionEqualSplit_gateFires_announceInvalid() public {
             HybridVoting hvCustom = _deploy(90, 10, 50, 0);
 
@@ -719,10 +663,6 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Gate refuses when quorum is unmet (new behavior) ─── */
 
-        /// Replaces the old "gate fires + announce invalidates" test. The new
-        /// gate predicts announceWinner's valid=true, so quorum is checked at
-        /// the gate level — no more wasted-tx case where the gate fires only
-        /// for announceWinner to reject.
         function test_EarlyClose_quorumUnmet_gateRefuses() public {
             HybridVoting hvCustom = _deploy(50, 50, 50, 10); // quorum=10
 
@@ -758,10 +698,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hvCustom.isEarlyCloseEligible(0), "YES still strict majority");
         }
 
-        /// Under the new turnout-only gate, the score is irrelevant — only
-        /// voterCount matters. Once turnout is reached the gate stays eligible
-        /// even if a follow-up vote ties the score.  announceWinner remains
-        /// the arbiter of validity.
         function test_EarlyClose_gateStaysEligibleOnTie_announceInvalidates() public {
             hats.setHatWearerStatus(CREATOR_HAT_ID, carol, false, false);
 
@@ -850,11 +786,6 @@ contract MockERC20EC is IERC20 {
 
         /* ─── Empty creatorHats + unrestricted + callerHint=0 → silently timer-only ─── */
 
-        /// Documented fallback per NatSpec in HybridVotingProposals._initProposal.
-        /// When there is no on-chain basis to anchor "half of eligible voters",
-        /// the snapshot resolves to 0 and the gate treats the proposal as legacy
-        /// timer-only. Callers wanting early-close in this configuration must
-        /// pass a non-zero callerEligibleHint.
         function test_EarlyClose_emptyCreatorHatsUnrestricted_timerOnly() public {
             uint256[] memory votingHats = new uint256[](2);
             votingHats[0] = DEFAULT_HAT_ID;
@@ -907,10 +838,6 @@ contract MockERC20EC is IERC20 {
          * Group C: Configurable turnout-percent gate (the new design).
          * ────────────────────────────────────────────────────────────────── */
 
-        /// Default behavior: a freshly-deployed org with earlyCloseTurnoutPct=100
-        /// (the recommended default for safety) requires EVERY eligible voter
-        /// to have cast a vote before early-close fires. This is the
-        /// strict-deliberation default that protects against disenfranchisement.
         function test_EarlyClose_turnoutPct100_requiresFullTurnout() public {
             HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 100, 0);
 
@@ -925,10 +852,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hvCustom.isEarlyCloseEligible(0), "3 of 3 -> gate fires");
         }
 
-        /// Custom org default: turnoutPct=67 lets the gate fire on 2 of 3
-        /// (ceil(3 × 67 / 100) = 3 → wait, 2.01 rounds up). With 3 voters
-        /// the ceiling math means 2 voters at 67% gives ceil(2.01) = 3 — so
-        /// 67% on 3 eligible is effectively 100%. Use 51 for a clearer split.
         function test_EarlyClose_turnoutPct51_fires_onMajorityTurnout() public {
             HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 51, 0);
 
@@ -942,7 +865,6 @@ contract MockERC20EC is IERC20 {
             assertTrue(hvCustom.isEarlyCloseEligible(0), "2 of 3 >= ceil(3*51/100)");
         }
 
-        /// setConfig path: the executor can adjust turnoutPct post-deploy.
         function test_EarlyClose_setConfigUpdatesTurnoutPct() public {
             assertEq(hv.earlyCloseTurnoutPct(), 50, "setUp uses 50");
 
@@ -970,9 +892,6 @@ contract MockERC20EC is IERC20 {
             hv.setConfig(HybridVoting.ConfigKey.EARLY_CLOSE_TURNOUT_PCT, abi.encode(uint8(75)));
         }
 
-        /// Per-proposal override: createProposalWithTurnoutPct lets the proposer
-        /// require a stricter turnout floor than the org default. Override must
-        /// be >= org default and <= 100.
         function test_EarlyClose_perProposalOverride_ratchetsUp() public {
             // Org default 50; override to 100 for a sensitive proposal.
             vm.prank(alice);
@@ -1001,10 +920,6 @@ contract MockERC20EC is IERC20 {
             hv.createProposalWithTurnoutPct("Too High", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 101);
         }
 
-        /// Subgraph discoverability: every proposal emits ProposalEarlyCloseConfig
-        /// with its full early-close configuration, regardless of which create
-        /// variant the caller used. Indexers can subscribe to this single event
-        /// to track snapshot value, per-proposal override, and timer-only opt-out.
         event ProposalEarlyCloseConfig(
             uint256 indexed id, uint64 snapshotEligibleVoters, uint8 turnoutPctOverride, bool isTimerOnly
         );
@@ -1037,8 +952,6 @@ contract MockERC20EC is IERC20 {
             hv.createProposalWithTurnoutPct("With Override", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 75);
         }
 
-        /// Per-proposal override of org default. Org default 100, override
-        /// stays at 100 (only equal or greater allowed; 100 is the ceiling).
         function test_EarlyClose_overrideEqualsOrgDefault_ok() public {
             HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 100, 0);
 
@@ -1047,7 +960,6 @@ contract MockERC20EC is IERC20 {
             assertEq(hvCustom.proposalTurnoutPct(0), 100);
         }
 
-        /// initialize rejects pct == 0 and pct > 100.
         function test_EarlyClose_initializeRejectsInvalidPct() public {
             address[] memory targets = new address[](0);
             uint256[] memory creatorHats = new uint256[](1);
@@ -1082,11 +994,7 @@ contract MockERC20EC is IERC20 {
             new BeaconProxy(address(beacon), bad101);
         }
 
-        /// Property: whenever the gate returns true, announceWinner returns
-        /// valid=true with the right winner FOR SCENARIOS where validity also
-        /// holds. The redesigned gate doesn't predict validity (that's
-        /// announceWinner's job); this test pins the existing happy-path
-        /// scenarios where both fire.
+        /// Happy-path scenarios where gate fires AND announceWinner returns valid.
         function test_EarlyClose_gateMatchesAnnounceWinnerInvariant() public {
             // Scenario 1: balanced 50/50 slices, 2 of 3 vote YES.
             HybridVoting hvA = _deploy(50, 50, 50, 0);

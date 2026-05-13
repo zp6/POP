@@ -54,11 +54,9 @@ contract HybridVoting is Initializable {
         ClassConfig[] classesSnapshot; // Snapshot the class config to freeze semantics for this proposal
         bool executed; // finalization guard
         uint32 voterCount; // unique voter count (consumed by async-majority early-close threshold)
-        // Async-majority snapshot: 0 = legacy timer-only; type(uint64).max = explicit
-        // timer-only opt-out; otherwise max(callerHint, on-chain hatSupply sum).
+        // 0 = legacy timer-only; type(uint64).max = opt-out; else max(hint, on-chain).
         uint64 snapshotEligibleVoters;
-        // Per-proposal turnout-percent override. 0 = use org default
-        // (Layout.earlyCloseTurnoutPct). Must be >= org default and <= 100 when set.
+        // 0 = use org default; else [orgDefault, 100].
         uint8 turnoutPctOverride;
     }
 
@@ -78,9 +76,7 @@ contract HybridVoting is Initializable {
         bool _paused; // Inline pausable state
         uint256 _lock; // Inline reentrancy guard state
         uint32 quorum; // minimum number of voters required (0 = disabled)
-        // Org default for early-close turnout. Range 1..100; 0 is the back-compat
-        // sentinel meaning "100" (so pre-upgrade orgs default to strict full-turnout
-        // early-close, the safest fallback). Configurable post-deploy via setConfig.
+        // 1..100; 0 in storage reads as 100 (safe back-compat default).
         uint8 earlyCloseTurnoutPct;
     }
 
@@ -276,10 +272,7 @@ contract HybridVoting is Initializable {
         _;
     }
 
-    /// announceWinner gate: passes if timer has expired OR async-majority
-    /// early-close threshold is met. Replaces the timer-only isExpired
-    /// modifier; legacy proposals (snapshotEligibleVoters == 0) revert
-    /// here when timer is unexpired and continue to use the timer path.
+    /// Passes if timer expired OR early-close gate met.
     modifier isExpiredOrEarlyClose(uint256 id) {
         _checkExpiredOrEarlyClose(id);
         _;
@@ -309,10 +302,7 @@ contract HybridVoting is Initializable {
         }
     }
 
-    /// Off-chain helper: returns whether a proposal currently meets the
-    /// async-majority early-close threshold without forcing the announceWinner
-    /// state transition. Indexers / clients can poll this view to surface
-    /// early-close-ready proposals.
+    /// True if announceWinner can be called right now via the early-close path.
     function isEarlyCloseEligible(uint256 id) external view returns (bool) {
         if (id >= _layout()._proposals.length) return false;
         return HybridVotingCore._isEarlyCloseEligible(id);
@@ -330,9 +320,6 @@ contract HybridVoting is Initializable {
         HybridVotingProposals.createProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds);
     }
 
-    /// Task #441: caller can over-count eligibleVoters for safety; contract
-    /// enforces max(callerHint, _eligibleVotersUpperBound(hatIds)). Caller
-    /// can never under-count below on-chain truth.
     function createProposalWithEligibleSnapshot(
         bytes calldata title,
         bytes32 descriptionHash,
@@ -347,10 +334,7 @@ contract HybridVoting is Initializable {
         );
     }
 
-    /// Per-proposal turnout override. Caller can ratchet UP only — the supplied
-    /// pct must be >= the org default and <= 100. Used for constitutional or
-    /// sensitive votes where the proposer wants a stricter turnout floor than
-    /// the org's default.
+    /// Per-proposal turnout override; pct must be in [orgDefault, 100].
     function createProposalWithTurnoutPct(
         bytes calldata title,
         bytes32 descriptionHash,

@@ -56,35 +56,9 @@ contract MockERC20RE is IERC20 {
         }
     }
 
-    /**
-     * CEI ordering property tests for HybridVoting.vote().
-     *
-     * Background: HybridVotingCore.vote() calls IERC20(cls.asset).balanceOf(voter)
-     * inside _calculateClassPower. cls.asset is configured via the executor-only
-     * `setClasses`, so direct injection of a malicious asset requires a passed
-     * governance proposal. The PR moves p.hasVoted[voter] = true to BEFORE that
-     * external call (Checks-Effects-Interactions ordering).
-     *
-     * The originally-cited attack — a malicious ERC20 whose balanceOf() re-enters
-     * vote() before hasVoted is set — is NOT exploitable today. Solidity emits
-     * STATICCALL when invoking a `view` function through IERC20, and the EVM
-     * enforces no-state-modification on the entire static-call subtree. The
-     * recursive vote() would revert because vote() writes storage.
-     *
-     * The CEI ordering remains correct hygiene for two reasons:
-     *   1. Forward-defense against future class strategies that might call a
-     *      non-view function on cls.asset (e.g. a "lock balance during vote"
-     *      pattern). Such a strategy would not run under STATICCALL and could
-     *      re-enter without the EVM blocking it.
-     *   2. Independent of any attack: the standard CEI pattern makes the
-     *      function's pre/post-conditions easier to reason about — by the time
-     *      any external code is invoked, all internal state updates from this
-     *      call are visible.
-     *
-     * This test file pins two observable properties guaranteed by the CEI
-     * ordering. We do NOT attempt to simulate the originally-cited attack,
-     * because the EVM physically prevents it under current Solidity.
-     */
+    /// CEI ordering property tests for HybridVoting.vote(). The cited balanceOf-
+    /// callback attack isn't exploitable today (STATICCALL blocks it); these tests
+    /// pin the observable post-condition + atomic-rollback property of CEI.
     contract HybridVotingReentrancyTest is Test {
         address owner = vm.addr(1);
         address alice = vm.addr(2);
@@ -154,10 +128,6 @@ contract MockERC20RE is IERC20 {
             hv.vote(0, idx, w);
         }
 
-        /// Property 1: A successful vote() sets hasVoted to true atomically and
-        /// reject all subsequent votes from the same voter with AlreadyVoted.
-        /// This is the post-condition the CEI ordering guarantees regardless of
-        /// what happens inside _calculateClassPower's external calls.
         function test_CEI_voteSetsHasVotedAtomically_subsequentVoteReverts() public {
             _vote(alice, 0);
 
@@ -171,12 +141,7 @@ contract MockERC20RE is IERC20 {
             hv.vote(0, idx, w);
         }
 
-        /// Property 2: If a vote() call reverts (e.g. via the zero-power check),
-        /// the EVM atomically rolls back the hasVoted=true flag set earlier in
-        /// the call. The voter remains eligible to retry. This is a property of
-        /// EVM atomicity but is critical to the CEI ordering being safe — without
-        /// rollback, the early hasVoted=true flip would permanently lock out
-        /// voters whose votes happened to revert.
+        /// Reverted vote() must roll back hasVoted so the voter can retry.
         function test_CEI_revertedVoteRollsBackHasVoted() public {
             // Construct a scenario where the first vote attempt reverts:
             // alice's balance is below minBalance for a transient moment.

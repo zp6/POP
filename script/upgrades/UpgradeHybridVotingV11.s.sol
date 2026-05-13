@@ -11,74 +11,10 @@ import {IExecutor} from "../../src/Executor.sol";
 import {IHats} from "@hats-protocol/src/Interfaces/IHats.sol";
 import {VotingErrors} from "../../src/libs/VotingErrors.sol";
 
-/**
- * @title HybridVoting v11 upgrade — configurable turnout-pct early-close
- *
- * What changed vs v10:
- *   1. Early-close gate redesigned: dropped the hardcoded ceil(N/2) turnout
- *      threshold + strict-majority check. New gate is purely turnout-based,
- *      with the threshold percent configurable per-org and overridable
- *      per-proposal. Default for new orgs is 100% (wait for every eligible
- *      voter — eliminates disenfranchisement risk; orgs can opt to lower
- *      via setConfig). Existing orgs upgrading have earlyCloseTurnoutPct = 0
- *      in storage, which the gate interprets as 100 (safe back-compat).
- *   2. New external functions: createProposalWithTurnoutPct(pct) lets a
- *      proposer ratchet UP from the org default; earlyCloseTurnoutPct() and
- *      proposalTurnoutPct(id) view helpers; setConfig EARLY_CLOSE_TURNOUT_PCT
- *      key for executor-driven updates.
- *   3. _eligibleVotersUpperBound overflow clamps to type(uint64).max - 1 so
- *      the timer-only opt-out sentinel stays unambiguous.
- *   4. _eligibleVotersUpperBound split into calldata + storage variants.
- *   5. HybridVoting.MIN_DURATION bumped 1 -> 10 (matches enforced library
- *      constant).
- *   6. CEI ordering test rewritten as honest property test.
- *   7. HybridVoting.initialize signature gains a new `uint8 earlyCloseTurnoutPct_`
- *      parameter (between thresholdPct and classes). OrgDeployer.DeploymentParams
- *      and GovernanceFactory.GovernanceParams now thread this through.
- *
- * Storage layout vs v10:
- *   - Proposal struct: append uint8 turnoutPctOverride (packs into existing
- *     trailing slot with executed/voterCount/snapshotEligibleVoters).
- *   - Layout struct: append uint8 earlyCloseTurnoutPct (packs with quorum).
- *   Purely additive — upgrade-safe per ERC-7201.
- *
- * Migration behavior for existing orgs (KUBI etc.):
- *   - Both new fields zero-init in storage.
- *   - Gate reads earlyCloseTurnoutPct == 0 as 100 (strict full-turnout default).
- *   - Existing proposals continue to use the timer path (snapshotEligibleVoters
- *     was already 0 for pre-v10 proposals; v10 set it but tied scores no longer
- *     auto-revoke the gate).
- *   - Executors can call setConfig(EARLY_CLOSE_TURNOUT_PCT, abi.encode(N))
- *     post-upgrade to opt the org into a looser threshold.
- *
- * Deployment flow (mirrors UpgradeVotingSelfTarget):
- *   1. Step1_DeployOnGnosis        — Deploy impl on Gnosis via DD (runs on Gnosis)
- *   2. Step2_UpgradeFromArbitrum   — Deploy on Arbitrum via DD + cross-chain
- *                                    beacon upgrade (runs on Arbitrum)
- *   3. Step3_Verify                — Confirm both chains picked up the upgrade
- *                                    (runs on Gnosis)
- *
- * ALWAYS run SimulateHybridVotingV11Upgrade first against an Arbitrum fork.
- * CLAUDE.md mandates sim-before-broadcast; never skip.
- *
- * Sim:
- *   source .env && FOUNDRY_PROFILE=production forge script \
- *     script/upgrades/UpgradeHybridVotingV11.s.sol:SimulateHybridVotingV11Upgrade \
- *     --rpc-url arbitrum -vvv
- *
- * Broadcast (3 steps, in order):
- *   source .env && FOUNDRY_PROFILE=production forge script \
- *     script/upgrades/UpgradeHybridVotingV11.s.sol:Step1_DeployOnGnosis \
- *     --rpc-url gnosis --broadcast --slow --private-key $DEPLOYER_PRIVATE_KEY
- *
- *   source .env && FOUNDRY_PROFILE=production forge script \
- *     script/upgrades/UpgradeHybridVotingV11.s.sol:Step2_UpgradeFromArbitrum \
- *     --rpc-url arbitrum --broadcast --slow --private-key $DEPLOYER_PRIVATE_KEY
- *
- *   FOUNDRY_PROFILE=production forge script \
- *     script/upgrades/UpgradeHybridVotingV11.s.sol:Step3_Verify \
- *     --rpc-url gnosis
- */
+/// HybridVoting v11: configurable turnout-pct early-close gate.
+/// Run SimulateHybridVotingV11Upgrade against an Arbitrum fork first,
+/// then Step1 (gnosis) -> Step2 (arbitrum, dispatches cross-chain) ->
+/// wait ~5 min for Hyperlane -> Step3 (verify gnosis). See PR #163.
 contract Step1_DeployOnGnosis is Script {
     address constant DD = 0x4aC8B5ebEb9D8C3dE3180ddF381D552d59e8835a;
     string constant VERSION = "v11";
@@ -179,21 +115,8 @@ contract Step3_Verify is Script {
     }
 }
 
-/**
- * @title SimulateHybridVotingV11Upgrade
- * @notice Fork-simulates the upgrade end-to-end on Arbitrum. Deploys v11, calls
- *         upgradeBeaconCrossChain under Hudson's prank, verifies the Arbitrum
- *         impl switched, and exercises the new isEarlyCloseEligible view +
- *         end-to-end vote flow against KUBI's live HybridVoting proxy.
- *
- * Does NOT verify Gnosis (cross-chain relay is not simulated locally — that's
- * what Step3_Verify is for after broadcast).
- *
- * Usage:
- *   source .env && FOUNDRY_PROFILE=production forge script \
- *     script/upgrades/UpgradeHybridVotingV11.s.sol:SimulateHybridVotingV11Upgrade \
- *     --rpc-url arbitrum -vvv
- */
+/// Fork-simulates the upgrade end-to-end on Arbitrum under Hudson's prank.
+/// Gnosis cross-chain relay isn't simulated; Step3_Verify covers that post-broadcast.
 contract SimulateHybridVotingV11Upgrade is Script {
     // Hub admin EOA per CLAUDE.md — Hudson. Owns PoaManagerHub on Arbitrum.
     address constant HUDSON = 0xA6F4D9f44Dd980b7168D829d5f74c2b00a46b2c9;
