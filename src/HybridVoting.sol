@@ -57,6 +57,9 @@ contract HybridVoting is Initializable {
         // Async-majority snapshot: 0 = legacy timer-only; type(uint64).max = explicit
         // timer-only opt-out; otherwise max(callerHint, on-chain hatSupply sum).
         uint64 snapshotEligibleVoters;
+        // Per-proposal turnout-percent override. 0 = use org default
+        // (Layout.earlyCloseTurnoutPct). Must be >= org default and <= 100 when set.
+        uint8 turnoutPctOverride;
     }
 
     /* ─────── ERC-7201 Storage ─────── */
@@ -75,6 +78,10 @@ contract HybridVoting is Initializable {
         bool _paused; // Inline pausable state
         uint256 _lock; // Inline reentrancy guard state
         uint32 quorum; // minimum number of voters required (0 = disabled)
+        // Org default for early-close turnout. Range 1..100; 0 is the back-compat
+        // sentinel meaning "100" (so pre-upgrade orgs default to strict full-turnout
+        // early-close, the safest fallback). Configurable post-deploy via setConfig.
+        uint8 earlyCloseTurnoutPct;
     }
 
     bytes32 private constant _STORAGE_SLOT = keccak256("poa.hybridvoting.v2.storage");
@@ -120,6 +127,7 @@ contract HybridVoting is Initializable {
     event ExecutorUpdated(address newExec);
     event ThresholdPctSet(uint8 pct);
     event QuorumSet(uint32 quorum);
+    event EarlyCloseTurnoutPctSet(uint8 pct);
 
     /* ─────── Initialiser ─────── */
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -133,6 +141,7 @@ contract HybridVoting is Initializable {
         uint256[] calldata initialCreatorHats,
         address[] calldata initialTargets,
         uint8 thresholdPct_,
+        uint8 earlyCloseTurnoutPct_,
         ClassConfig[] calldata initialClasses
     ) external initializer {
         if (hats_ == address(0) || executor_ == address(0)) {
@@ -140,6 +149,9 @@ contract HybridVoting is Initializable {
         }
 
         VotingMath.validateThreshold(thresholdPct_);
+        if (earlyCloseTurnoutPct_ == 0 || earlyCloseTurnoutPct_ > 100) {
+            revert VotingErrors.InvalidTurnoutPct();
+        }
 
         Layout storage l = _layout();
         l.hats = IHats(hats_);
@@ -149,6 +161,9 @@ contract HybridVoting is Initializable {
 
         l.thresholdPct = thresholdPct_;
         emit ThresholdPctSet(thresholdPct_);
+
+        l.earlyCloseTurnoutPct = earlyCloseTurnoutPct_;
+        emit EarlyCloseTurnoutPctSet(earlyCloseTurnoutPct_);
 
         _initializeCreatorHats(initialCreatorHats);
         // initialTargets parameter kept for ABI compatibility but not used;
@@ -216,7 +231,8 @@ contract HybridVoting is Initializable {
         THRESHOLD,
         TARGET_ALLOWED, // deprecated: kept for enum ordering compatibility
         EXECUTOR,
-        QUORUM
+        QUORUM,
+        EARLY_CLOSE_TURNOUT_PCT
     }
 
     function setConfig(ConfigKey key, bytes calldata value) external onlyExecutor {
@@ -236,6 +252,11 @@ contract HybridVoting is Initializable {
             uint32 q = abi.decode(value, (uint32));
             l.quorum = q;
             emit QuorumSet(q);
+        } else if (key == ConfigKey.EARLY_CLOSE_TURNOUT_PCT) {
+            uint8 pct = abi.decode(value, (uint8));
+            if (pct == 0 || pct > 100) revert VotingErrors.InvalidTurnoutPct();
+            l.earlyCloseTurnoutPct = pct;
+            emit EarlyCloseTurnoutPctSet(pct);
         }
     }
 
@@ -326,18 +347,21 @@ contract HybridVoting is Initializable {
         );
     }
 
-    /// Task #441: explicit opt-out — proposal stays timer-only regardless of
-    /// vote counts. Useful for sprint-priority proposals wanting full window.
-    function createProposalLegacyTimerOnly(
+    /// Per-proposal turnout override. Caller can ratchet UP only — the supplied
+    /// pct must be >= the org default and <= 100. Used for constitutional or
+    /// sensitive votes where the proposer wants a stricter turnout floor than
+    /// the org's default.
+    function createProposalWithTurnoutPct(
         bytes calldata title,
         bytes32 descriptionHash,
         uint32 minutesDuration,
         uint8 numOptions,
         IExecutor.Call[][] calldata batches,
-        uint256[] calldata hatIds
+        uint256[] calldata hatIds,
+        uint8 turnoutPctOverride
     ) external onlyCreator whenNotPaused {
-        HybridVotingProposals.createProposalLegacyTimerOnly(
-            title, descriptionHash, minutesDuration, numOptions, batches, hatIds
+        HybridVotingProposals.createProposalWithTurnoutPct(
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, turnoutPctOverride
         );
     }
 
@@ -368,6 +392,18 @@ contract HybridVoting is Initializable {
 
     function quorum() external view returns (uint32) {
         return _layout().quorum;
+    }
+
+    function earlyCloseTurnoutPct() external view returns (uint8) {
+        uint8 stored = _layout().earlyCloseTurnoutPct;
+        return stored == 0 ? 100 : stored;
+    }
+
+    function proposalTurnoutPct(uint256 id) external view exists(id) returns (uint8) {
+        uint8 override_ = _layout()._proposals[id].turnoutPctOverride;
+        if (override_ != 0) return override_;
+        uint8 stored = _layout().earlyCloseTurnoutPct;
+        return stored == 0 ? 100 : stored;
     }
 
     function creatorHats() external view returns (uint256[] memory) {

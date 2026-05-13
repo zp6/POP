@@ -28,6 +28,19 @@ library HybridVotingProposals {
         uint256[] hatIds
     );
 
+    /// Emitted once per proposal creation alongside NewProposal/NewHatProposal.
+    /// Exposes the complete early-close config so indexers can determine, at
+    /// event-parse time:
+    ///   - whether the proposal can ever early-close (isTimerOnly == true means
+    ///     no — snapshot is the type(uint64).max opt-out sentinel)
+    ///   - the eligibility snapshot used as the threshold denominator
+    ///   - any per-proposal override of the org-level turnout percent
+    /// The effective turnout pct is `turnoutPctOverride` if non-zero, else the
+    /// current org default tracked by EarlyCloseTurnoutPctSet events.
+    event ProposalEarlyCloseConfig(
+        uint256 indexed id, uint64 snapshotEligibleVoters, uint8 turnoutPctOverride, bool isTimerOnly
+    );
+
     function _layout() private pure returns (HybridVoting.Layout storage s) {
         bytes32 slot = _STORAGE_SLOT;
         assembly {
@@ -46,7 +59,7 @@ library HybridVotingProposals {
         IExecutor.Call[][] calldata batches,
         uint256[] calldata hatIds
     ) external {
-        uint256 id = _initProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds, 0);
+        uint256 id = _initProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds, 0, 0);
 
         uint64 endTs = _layout()._proposals[id].endTimestamp;
 
@@ -63,6 +76,12 @@ library HybridVotingProposals {
     /// early-close threshold conservative. The stored snapshot is
     /// max(callerEligibleHint, on-chain hatSupply sum) — under-count is
     /// impossible by construction; over-count makes early-close stricter.
+    ///
+    /// Special sentinel: passing `callerEligibleHint = type(uint64).max`
+    /// disables early-close entirely for this proposal — it must run its
+    /// full timer regardless of how many voters participate. Use this for
+    /// proposals where the duration itself is the policy (RFC windows,
+    /// mandatory deliberation periods, externally-coordinated timing).
     function createProposalWithEligibleSnapshot(
         bytes calldata title,
         bytes32 descriptionHash,
@@ -73,7 +92,7 @@ library HybridVotingProposals {
         uint64 callerEligibleHint
     ) external {
         uint256 id = _initProposal(
-            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, callerEligibleHint
+            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, callerEligibleHint, 0
         );
 
         uint64 endTs = _layout()._proposals[id].endTimestamp;
@@ -85,24 +104,30 @@ library HybridVotingProposals {
         }
     }
 
-    /// Variant that explicitly opts out of async-majority early-close, even
-    /// when the timer is unexpired. snapshotEligibleVoters is set to
-    /// type(uint64).max so the early-close gate can never be satisfied. Use
-    /// for proposals that should always run their full duration (e.g., sprint
-    /// priority votes).
-    function createProposalLegacyTimerOnly(
+    /// Variant that sets a per-proposal early-close turnout percent override.
+    /// The override must be in [orgDefault, 100] — callers can only ratchet
+    /// UP from the org's default (mirrors the under-count guard for snapshot
+    /// hints). Used for sensitive proposals (constitutional changes, large
+    /// treasury moves) where the proposer wants a stricter turnout floor.
+    function createProposalWithTurnoutPct(
         bytes calldata title,
         bytes32 descriptionHash,
         uint32 minutesDuration,
         uint8 numOptions,
         IExecutor.Call[][] calldata batches,
-        uint256[] calldata hatIds
+        uint256[] calldata hatIds,
+        uint8 turnoutPctOverride
     ) external {
-        uint256 id = _initProposal(
-            title, descriptionHash, minutesDuration, numOptions, batches, hatIds, type(uint64).max
-        );
+        HybridVoting.Layout storage l = _layout();
+        uint8 orgDefault = l.earlyCloseTurnoutPct == 0 ? 100 : l.earlyCloseTurnoutPct;
+        if (turnoutPctOverride < orgDefault || turnoutPctOverride > 100) {
+            revert VotingErrors.InvalidTurnoutPct();
+        }
 
-        uint64 endTs = _layout()._proposals[id].endTimestamp;
+        uint256 id =
+            _initProposal(title, descriptionHash, minutesDuration, numOptions, batches, hatIds, 0, turnoutPctOverride);
+
+        uint64 endTs = l._proposals[id].endTimestamp;
 
         if (hatIds.length > 0) {
             emit NewHatProposal(id, title, descriptionHash, numOptions, endTs, uint64(block.timestamp), hatIds);
@@ -118,7 +143,8 @@ library HybridVotingProposals {
         uint8 numOptions,
         IExecutor.Call[][] calldata batches,
         uint256[] calldata hatIds,
-        uint64 callerEligibleHint
+        uint64 callerEligibleHint,
+        uint8 turnoutPctOverride
     ) internal returns (uint256) {
         ValidationLib.requireValidTitle(title);
         if (numOptions == 0) revert VotingErrors.LengthMismatch();
@@ -200,6 +226,14 @@ library HybridVotingProposals {
                 : _eligibleVotersUpperBoundStorage(l.creatorHatIds);
             p.snapshotEligibleVoters = callerEligibleHint > onChainUpperBound ? callerEligibleHint : onChainUpperBound;
         }
+
+        if (turnoutPctOverride != 0) {
+            p.turnoutPctOverride = turnoutPctOverride;
+        }
+
+        emit ProposalEarlyCloseConfig(
+            id, p.snapshotEligibleVoters, turnoutPctOverride, p.snapshotEligibleVoters == type(uint64).max
+        );
 
         return id;
     }

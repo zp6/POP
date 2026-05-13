@@ -129,7 +129,8 @@ contract MockERC20RE is IERC20 {
             });
 
             bytes memory initData = abi.encodeCall(
-                HybridVoting.initialize, (address(hats), address(exec), creatorHats, targets, uint8(50), classes)
+                HybridVoting.initialize,
+                (address(hats), address(exec), creatorHats, targets, uint8(50), uint8(50), classes)
             );
 
             HybridVoting impl = new HybridVoting();

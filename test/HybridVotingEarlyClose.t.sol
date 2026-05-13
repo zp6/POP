@@ -148,7 +148,8 @@ contract MockERC20EC is IERC20 {
             });
 
             bytes memory initData = abi.encodeCall(
-                HybridVoting.initialize, (address(hats), address(exec), creatorHats, targets, uint8(50), classes)
+                HybridVoting.initialize,
+                (address(hats), address(exec), creatorHats, targets, uint8(50), uint8(50), classes)
             );
 
             HybridVoting impl = new HybridVoting();
@@ -202,9 +203,16 @@ contract MockERC20EC is IERC20 {
         }
 
         function _createLegacyTimerOnly() internal {
+            // The dedicated `createProposalLegacyTimerOnly` was removed in this PR
+            // to save bytecode. The same opt-out is still reachable via the
+            // snapshot sentinel: passing type(uint64).max as the caller hint
+            // sets snapshotEligibleVoters to the opt-out value, so the gate
+            // can never fire.
             bytes memory title = "Legacy Timer Only";
             vm.prank(alice);
-            hv.createProposalLegacyTimerOnly(title, bytes32(0), 60, 2, _emptyBatches(), new uint256[](0));
+            hv.createProposalWithEligibleSnapshot(
+                title, bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), type(uint64).max
+            );
         }
 
         /* ─── Scenario 1: threshold met + majority → early-close fires ─── */
@@ -231,15 +239,22 @@ contract MockERC20EC is IERC20 {
             hv.announceWinner(0);
         }
 
-        /* ─── Scenario 3: threshold met but tied → reverts (strict majority) ─── */
+        /* ─── Scenario 3: threshold met but tied → gate fires; announceWinner returns invalid ─── */
 
-        function test_EarlyClose_thresholdMetButTied_revertsVotingOpen() public {
+        /// Under the new turnout-only gate, a tied vote with turnout reached
+        /// still passes the gate (turnout doesn't care about score). The
+        /// validity check happens in announceWinner via pickWinnerNSlices,
+        /// which returns valid=false for a tie. So the call no longer reverts
+        /// — it returns (0, false) and the proposal is marked executed.
+        function test_EarlyClose_thresholdMetButTied_announceReturnsInvalid() public {
             _createDefault();
             // 2 of 3 vote split 1-1 between YES and NO
             _voteYes(alice);
             _voteNo(bob);
-            vm.expectRevert(VotingErrors.VotingOpen.selector);
-            hv.announceWinner(0);
+            assertTrue(hv.isEarlyCloseEligible(0), "turnout-only gate fires regardless of tie");
+            (uint256 win, bool ok) = hv.announceWinner(0);
+            assertFalse(ok, "announceWinner returns invalid for tied score");
+            assertEq(win, 0);
         }
 
         /* ─── Scenario 4: callerHint=0 (default path) uses on-chain truth ─── */
@@ -517,6 +532,19 @@ contract MockERC20EC is IERC20 {
             internal
             returns (HybridVoting hvOut)
         {
+            return _deployWithTurnout(ddSlice, ercSlice, thresholdPct_, 50, quorum_);
+        }
+
+        /// Same as `_deploy` but lets the test specify a custom org-default
+        /// early-close turnout percent. Default `_deploy` uses 50 to preserve
+        /// the pre-redesign ceil(N/2) semantics that most tests assume.
+        function _deployWithTurnout(
+            uint8 ddSlice,
+            uint8 ercSlice,
+            uint8 thresholdPct_,
+            uint8 earlyCloseTurnoutPct_,
+            uint32 quorum_
+        ) internal returns (HybridVoting hvOut) {
             uint256[] memory votingHats = new uint256[](2);
             votingHats[0] = DEFAULT_HAT_ID;
             votingHats[1] = EXECUTIVE_HAT_ID;
@@ -546,7 +574,8 @@ contract MockERC20EC is IERC20 {
             });
 
             bytes memory initData = abi.encodeCall(
-                HybridVoting.initialize, (address(hats), address(exec), creatorHats, targets, thresholdPct_, classes)
+                HybridVoting.initialize,
+                (address(hats), address(exec), creatorHats, targets, thresholdPct_, earlyCloseTurnoutPct_, classes)
             );
 
             HybridVoting impl = new HybridVoting();
@@ -624,9 +653,13 @@ contract MockERC20EC is IERC20 {
             assertEq(win, 0, "announceWinner picks YES (same as gate predicts)");
         }
 
-        /* ─── 3-option equal split: gate refuses (no strict majority) ─── */
+        /* ─── 3-option equal split: gate fires (turnout met); announceWinner returns invalid ─── */
 
-        function test_EarlyClose_threeOptionEqualSplit_gateRefuses() public {
+        /// Under the new turnout-only gate, a 3-way tie with full turnout still
+        /// passes the gate. announceWinner's pickWinnerNSlices is the validity
+        /// arbiter and returns (0, false) for the tied scenario (no option meets
+        /// the threshold AND has strict margin).
+        function test_EarlyClose_threeOptionEqualSplit_gateFires_announceInvalid() public {
             HybridVoting hvCustom = _deploy(90, 10, 50, 0);
 
             vm.prank(alice);
@@ -636,10 +669,11 @@ contract MockERC20EC is IERC20 {
             _voteOn(hvCustom, bob, 0, 1);
             _voteOn(hvCustom, carol, 0, 2);
 
-            // Each option ~33% slice-weighted; no strict majority; thresholdMet also fails (33 < 50).
-            assertFalse(hvCustom.isEarlyCloseEligible(0));
-            vm.expectRevert(VotingErrors.VotingOpen.selector);
-            hvCustom.announceWinner(0);
+            // 3 of 3 voted at 50% turnout floor → gate fires.
+            assertTrue(hvCustom.isEarlyCloseEligible(0));
+            (uint256 win, bool ok) = hvCustom.announceWinner(0);
+            assertFalse(ok, "tied 3-way split -> announceWinner invalid");
+            assertEq(win, 0);
         }
 
         /* ─── Pause blocks announceWinner even when gate is eligible ─── */
@@ -724,8 +758,11 @@ contract MockERC20EC is IERC20 {
             assertTrue(hvCustom.isEarlyCloseEligible(0), "YES still strict majority");
         }
 
-        function test_EarlyClose_gateRevokesEligibilityOnTie() public {
-            // Reduce on-chain CREATOR supply to 2 so threshold = ceil(2/2) = 1.
+        /// Under the new turnout-only gate, the score is irrelevant — only
+        /// voterCount matters. Once turnout is reached the gate stays eligible
+        /// even if a follow-up vote ties the score.  announceWinner remains
+        /// the arbiter of validity.
+        function test_EarlyClose_gateStaysEligibleOnTie_announceInvalidates() public {
             hats.setHatWearerStatus(CREATOR_HAT_ID, carol, false, false);
 
             HybridVoting hvCustom = _deploy(50, 50, 50, 0);
@@ -737,7 +774,11 @@ contract MockERC20EC is IERC20 {
             assertTrue(hvCustom.isEarlyCloseEligible(0), "1 voter, threshold 1, unanimous");
 
             _voteOn(hvCustom, bob, 0, 1);
-            assertFalse(hvCustom.isEarlyCloseEligible(0), "tied scores revoke gate");
+            // New turnout-only gate keeps firing — score doesn't matter at the gate.
+            assertTrue(hvCustom.isEarlyCloseEligible(0), "turnout already reached");
+
+            (, bool ok) = hvCustom.announceWinner(0);
+            assertFalse(ok, "tied score -> announce returns invalid");
         }
 
         /* ─── Early-close path executes batches via executor ─── */
@@ -843,7 +884,8 @@ contract MockERC20EC is IERC20 {
             });
 
             bytes memory initData = abi.encodeCall(
-                HybridVoting.initialize, (address(hats), address(exec), emptyCreatorHats, targets, uint8(50), classes)
+                HybridVoting.initialize,
+                (address(hats), address(exec), emptyCreatorHats, targets, uint8(50), uint8(100), classes)
             );
 
             HybridVoting impl = new HybridVoting();
@@ -862,58 +904,189 @@ contract MockERC20EC is IERC20 {
         }
 
         /* ──────────────────────────────────────────────────────────────────
-         * Group C: New gate semantics introduced by the slice-weighted rewrite.
+         * Group C: Configurable turnout-percent gate (the new design).
          * ────────────────────────────────────────────────────────────────── */
 
-        /// High thresholdPct (90) blocks the gate even when a clear majority
-        /// holds. Mirrors announceWinner's threshold gate.
-        function test_EarlyClose_highThresholdPct_blocksOnPlurality() public {
-            HybridVoting hvCustom = _deploy(50, 50, 90, 0); // thresholdPct=90
+        /// Default behavior: a freshly-deployed org with earlyCloseTurnoutPct=100
+        /// (the recommended default for safety) requires EVERY eligible voter
+        /// to have cast a vote before early-close fires. This is the
+        /// strict-deliberation default that protects against disenfranchisement.
+        function test_EarlyClose_turnoutPct100_requiresFullTurnout() public {
+            HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 100, 0);
 
             vm.prank(alice);
-            hvCustom.createProposal("High Threshold", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0));
+            hvCustom.createProposal("Full Turnout", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0));
 
-            // 2 of 3 vote YES, 1 votes NO. YES slice-weighted = ~66.6%, NO = ~33.3%.
-            // strictMajority TRUE (66.6 > 50). thresholdMet FALSE (66.6 < 90).
             _voteOn(hvCustom, alice, 0, 0);
+            assertFalse(hvCustom.isEarlyCloseEligible(0), "1 of 3 not enough at pct=100");
             _voteOn(hvCustom, bob, 0, 0);
-            _voteOn(hvCustom, carol, 0, 1);
-
-            assertFalse(hvCustom.isEarlyCloseEligible(0), "gate respects thresholdPct=90");
-
-            // announceWinner also returns valid=false (winner=YES at 66.6% < 90% threshold).
-            vm.expectRevert(VotingErrors.VotingOpen.selector);
-            hvCustom.announceWinner(0);
+            assertFalse(hvCustom.isEarlyCloseEligible(0), "2 of 3 not enough at pct=100");
+            _voteOn(hvCustom, carol, 0, 0);
+            assertTrue(hvCustom.isEarlyCloseEligible(0), "3 of 3 -> gate fires");
         }
 
-        /// Plurality without strict majority: leader at exactly 50% slice-
-        /// weighted, but strictMajority requires > 50% (hi * 2 > totalScore).
-        /// Constructed via 3 voters all casting weights 50/49/1 across 3 options.
-        function test_EarlyClose_pluralityWithoutStrictMajority_gateRefuses() public {
-            HybridVoting hvCustom = _deploy(50, 50, 30, 0); // thresholdPct=30 (low, so won't be the blocker)
+        /// Custom org default: turnoutPct=67 lets the gate fire on 2 of 3
+        /// (ceil(3 × 67 / 100) = 3 → wait, 2.01 rounds up). With 3 voters
+        /// the ceiling math means 2 voters at 67% gives ceil(2.01) = 3 — so
+        /// 67% on 3 eligible is effectively 100%. Use 51 for a clearer split.
+        function test_EarlyClose_turnoutPct51_fires_onMajorityTurnout() public {
+            HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 51, 0);
 
             vm.prank(alice);
-            hvCustom.createProposal("Plurality 50/49/1", bytes32(0), 60, 3, _emptyBatches3(), new uint256[](0));
+            hvCustom.createProposal("Majority Turnout", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0));
 
-            uint8[] memory idx = new uint8[](3);
-            idx[0] = 0;
-            idx[1] = 1;
-            idx[2] = 2;
-            uint8[] memory w = new uint8[](3);
-            w[0] = 50;
-            w[1] = 49;
-            w[2] = 1;
+            // ceil(3 × 51 / 100) = ceil(1.53) = 2 → 2 voters trigger the gate.
+            _voteOn(hvCustom, alice, 0, 0);
+            assertFalse(hvCustom.isEarlyCloseEligible(0));
+            _voteOn(hvCustom, bob, 0, 0);
+            assertTrue(hvCustom.isEarlyCloseEligible(0), "2 of 3 >= ceil(3*51/100)");
+        }
 
-            _voteWeighted(hvCustom, alice, 0, idx, w);
-            _voteWeighted(hvCustom, bob, 0, idx, w);
-            _voteWeighted(hvCustom, carol, 0, idx, w);
+        /// setConfig path: the executor can adjust turnoutPct post-deploy.
+        function test_EarlyClose_setConfigUpdatesTurnoutPct() public {
+            assertEq(hv.earlyCloseTurnoutPct(), 50, "setUp uses 50");
 
-            // Option 0 slice-weighted: exactly 50% of total. hi * 2 == totalScore, NOT >.
-            assertFalse(hvCustom.isEarlyCloseEligible(0), "exactly 50% is not strict majority");
+            vm.prank(address(exec));
+            hv.setConfig(HybridVoting.ConfigKey.EARLY_CLOSE_TURNOUT_PCT, abi.encode(uint8(75)));
+
+            assertEq(hv.earlyCloseTurnoutPct(), 75, "executor updated to 75");
+        }
+
+        function test_EarlyClose_setConfigRejectsInvalidPct() public {
+            vm.startPrank(address(exec));
+
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            hv.setConfig(HybridVoting.ConfigKey.EARLY_CLOSE_TURNOUT_PCT, abi.encode(uint8(0)));
+
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            hv.setConfig(HybridVoting.ConfigKey.EARLY_CLOSE_TURNOUT_PCT, abi.encode(uint8(101)));
+
+            vm.stopPrank();
+        }
+
+        function test_EarlyClose_setConfigOnlyExecutor() public {
+            vm.prank(alice);
+            vm.expectRevert(VotingErrors.Unauthorized.selector);
+            hv.setConfig(HybridVoting.ConfigKey.EARLY_CLOSE_TURNOUT_PCT, abi.encode(uint8(75)));
+        }
+
+        /// Per-proposal override: createProposalWithTurnoutPct lets the proposer
+        /// require a stricter turnout floor than the org default. Override must
+        /// be >= org default and <= 100.
+        function test_EarlyClose_perProposalOverride_ratchetsUp() public {
+            // Org default 50; override to 100 for a sensitive proposal.
+            vm.prank(alice);
+            hv.createProposalWithTurnoutPct("Sensitive", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 100);
+
+            assertEq(hv.proposalTurnoutPct(0), 100, "proposal pct = 100");
+
+            // Org default 50% would trigger at 2 voters; override 100 requires 3.
+            _voteYes(alice);
+            _voteYes(bob);
+            assertFalse(hv.isEarlyCloseEligible(0), "2 of 3 below override 100%");
+            _voteYes(carol);
+            assertTrue(hv.isEarlyCloseEligible(0), "3 of 3 meets override 100%");
+        }
+
+        function test_EarlyClose_overrideRejectedBelowOrgDefault() public {
+            // Org default 50; trying override=30 must revert.
+            vm.prank(alice);
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            hv.createProposalWithTurnoutPct("Too Low", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 30);
+        }
+
+        function test_EarlyClose_overrideRejectedAbove100() public {
+            vm.prank(alice);
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            hv.createProposalWithTurnoutPct("Too High", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 101);
+        }
+
+        /// Subgraph discoverability: every proposal emits ProposalEarlyCloseConfig
+        /// with its full early-close configuration, regardless of which create
+        /// variant the caller used. Indexers can subscribe to this single event
+        /// to track snapshot value, per-proposal override, and timer-only opt-out.
+        event ProposalEarlyCloseConfig(
+            uint256 indexed id, uint64 snapshotEligibleVoters, uint8 turnoutPctOverride, bool isTimerOnly
+        );
+
+        function test_EarlyClose_eventEmittedOnCreateProposal() public {
+            vm.expectEmit(true, false, false, true);
+            // alice/bob/carol all wear CREATOR_HAT_ID, so the snapshot is 3.
+            emit ProposalEarlyCloseConfig(0, 3, 0, false);
+            _createDefault();
+        }
+
+        function test_EarlyClose_eventEmittedOnWithEligibleSnapshot() public {
+            // Caller hint 10 > onChainSum 3 → snapshot becomes 10.
+            vm.expectEmit(true, false, false, true);
+            emit ProposalEarlyCloseConfig(0, 10, 0, false);
+            _createWithHint(10);
+        }
+
+        function test_EarlyClose_eventEmittedOnLegacyTimerOnly() public {
+            vm.expectEmit(true, false, false, true);
+            emit ProposalEarlyCloseConfig(0, type(uint64).max, 0, true);
+            _createLegacyTimerOnly();
+        }
+
+        function test_EarlyClose_eventEmittedOnWithTurnoutPct() public {
+            // Org default = 50 (from setUp); override to 75.
+            vm.expectEmit(true, false, false, true);
+            emit ProposalEarlyCloseConfig(0, 3, 75, false);
+            vm.prank(alice);
+            hv.createProposalWithTurnoutPct("With Override", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 75);
+        }
+
+        /// Per-proposal override of org default. Org default 100, override
+        /// stays at 100 (only equal or greater allowed; 100 is the ceiling).
+        function test_EarlyClose_overrideEqualsOrgDefault_ok() public {
+            HybridVoting hvCustom = _deployWithTurnout(50, 50, 50, 100, 0);
+
+            vm.prank(alice);
+            hvCustom.createProposalWithTurnoutPct("Equal", bytes32(0), 60, 2, _emptyBatches(), new uint256[](0), 100);
+            assertEq(hvCustom.proposalTurnoutPct(0), 100);
+        }
+
+        /// initialize rejects pct == 0 and pct > 100.
+        function test_EarlyClose_initializeRejectsInvalidPct() public {
+            address[] memory targets = new address[](0);
+            uint256[] memory creatorHats = new uint256[](1);
+            creatorHats[0] = CREATOR_HAT_ID;
+            HybridVoting.ClassConfig[] memory classes = new HybridVoting.ClassConfig[](1);
+            uint256[] memory democracyHats = new uint256[](1);
+            democracyHats[0] = EXECUTIVE_HAT_ID;
+            classes[0] = HybridVoting.ClassConfig({
+                strategy: HybridVoting.ClassStrategy.DIRECT,
+                slicePct: 100,
+                quadratic: false,
+                minBalance: 0,
+                asset: address(0),
+                hatIds: democracyHats
+            });
+
+            HybridVoting impl = new HybridVoting();
+            UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), owner);
+
+            bytes memory badZero = abi.encodeCall(
+                HybridVoting.initialize,
+                (address(hats), address(exec), creatorHats, targets, uint8(50), uint8(0), classes)
+            );
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            new BeaconProxy(address(beacon), badZero);
+
+            bytes memory bad101 = abi.encodeCall(
+                HybridVoting.initialize,
+                (address(hats), address(exec), creatorHats, targets, uint8(50), uint8(101), classes)
+            );
+            vm.expectRevert(VotingErrors.InvalidTurnoutPct.selector);
+            new BeaconProxy(address(beacon), bad101);
         }
 
         /// Property: whenever the gate returns true, announceWinner returns
-        /// valid=true with the same winner. Three hand-crafted scenarios.
+        /// valid=true with the right winner FOR SCENARIOS where validity also
+        /// holds. The redesigned gate doesn't predict validity (that's
+        /// announceWinner's job); this test pins the existing happy-path
+        /// scenarios where both fire.
         function test_EarlyClose_gateMatchesAnnounceWinnerInvariant() public {
             // Scenario 1: balanced 50/50 slices, 2 of 3 vote YES.
             HybridVoting hvA = _deploy(50, 50, 50, 0);

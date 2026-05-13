@@ -131,28 +131,31 @@ library HybridVotingCore {
         emit VoteCast(id, voter, idxs, weights, classRawPowers, uint64(block.timestamp));
     }
 
-    /// Async-majority early-close gate (Proposal #60). Returns true iff
-    /// announceWinner could be called right now and would return
-    /// `valid == true` with a strict-majority winner.
+    /// Early-close gate (Proposal #60, redesigned). Returns true iff turnout
+    /// has reached the org-configured threshold AND the proposal-level quorum
+    /// (if set) is satisfied. No majority / score check at the gate —
+    /// announceWinner's existing winner-picking and validity logic remains
+    /// the final arbiter of who wins.
     ///
     /// Conditions (all must hold):
     ///   1. snapshotEligibleVoters is an active value (not 0 — legacy
-    ///      pre-upgrade proposals; not type(uint64).max — explicit
-    ///      timer-only opt-out).
-    ///   2. voterCount has reached ceil(snapshotEligibleVoters / 2).
-    ///   3. Quorum (if set) is satisfied. announceWinner enforces this
-    ///      internally; checking here avoids firing the gate on a path
-    ///      that would invalidate.
-    ///   4. The slice-weighted score for the leading option meets the
-    ///      same valid=true predicate that VotingMath.pickWinnerNSlices
-    ///      uses: hi >= thresholdPct * N_SLICE_PRECISION AND hi > second.
-    ///   5. PR #60's documented "strict majority" intent: the leading
-    ///      option holds > 50% of total slice-weighted score.
+    ///      pre-upgrade proposals stay timer-only; not type(uint64).max —
+    ///      explicit timer-only opt-out at create time).
+    ///   2. voterCount has reached ceil(snapshotEligibleVoters * pct / 100)
+    ///      where pct is the proposal's turnoutPctOverride if set, else the
+    ///      org-level earlyCloseTurnoutPct. Both 0 means 100 (safe default —
+    ///      strict full-turnout early-close).
+    ///   3. Quorum (if set) is satisfied — mirrors announceWinner's check so
+    ///      the gate doesn't fire on a path that would invalidate.
     ///
-    /// Scoring mirrors VotingMath.pickWinnerNSlices line-for-line: for
-    /// each option, score is sum of (optRaw * slice * PRECISION) / classTotal
-    /// across classes (skipping classes with zero total). This guarantees
-    /// the gate predicts the same winner announceWinner picks.
+    /// Why no majority check: orgs choose their own turnout floor (100% means
+    /// "wait for everyone" — no disenfranchisement risk; lower values let the
+    /// org trade deliberation for speed at their discretion). A hardcoded
+    /// "strict majority" requirement on top would override the org's
+    /// configured trust model. If turnout is reached but no option has a valid
+    /// winner under thresholdPct / strict-margin rules, announceWinner returns
+    /// (0, false) — the gate is permission to attempt announce, not a
+    /// guarantee of validity.
     function _isEarlyCloseEligible(uint256 id) internal view returns (bool) {
         HybridVoting.Layout storage l = _layout();
         if (id >= l._proposals.length) return false;
@@ -161,48 +164,19 @@ library HybridVotingCore {
         if (p.snapshotEligibleVoters == 0) return false;
         if (p.snapshotEligibleVoters == type(uint64).max) return false;
 
-        uint64 threshold = (p.snapshotEligibleVoters + 1) / 2;
-        if (p.voterCount < threshold) return false;
+        // Resolve effective turnout percent: per-proposal override > org default;
+        // 0 (legacy back-compat sentinel) -> 100.
+        uint8 pct = p.turnoutPctOverride != 0 ? p.turnoutPctOverride : l.earlyCloseTurnoutPct;
+        if (pct == 0) pct = 100;
+
+        // Ceiling division: threshold = ceil(eligible * pct / 100).
+        // Max eligible (uint64) * 100 = 1.8e21, well under uint256.max.
+        uint256 threshold = (uint256(p.snapshotEligibleVoters) * pct + 99) / 100;
+        if (uint256(p.voterCount) < threshold) return false;
+
         if (l.quorum > 0 && p.voterCount < l.quorum) return false;
 
-        uint256 numOptions = p.options.length;
-        uint256 numClasses = p.classesSnapshot.length;
-        if (numOptions == 0) return false;
-
-        uint256 hi;
-        uint256 second;
-        uint256 totalScore;
-        for (uint256 opt; opt < numOptions;) {
-            uint256 score;
-            for (uint256 cls; cls < numClasses;) {
-                uint256 classTotal = p.classTotalsRaw[cls];
-                if (classTotal > 0) {
-                    score += (uint256(p.options[opt].classRaw[cls])
-                            * p.classesSnapshot[cls].slicePct
-                            * VotingMath.N_SLICE_PRECISION) / classTotal;
-                }
-                unchecked {
-                    ++cls;
-                }
-            }
-            totalScore += score;
-            if (score > hi) {
-                second = hi;
-                hi = score;
-            } else if (score > second) {
-                second = score;
-            }
-            unchecked {
-                ++opt;
-            }
-        }
-
-        if (totalScore == 0) return false;
-
-        bool thresholdMet = hi >= uint256(l.thresholdPct) * VotingMath.N_SLICE_PRECISION;
-        bool strictMargin = hi > second;
-        bool strictMajority = hi * 2 > totalScore;
-        return thresholdMet && strictMargin && strictMajority;
+        return true;
     }
 
     function _calculateClassPower(address voter, HybridVoting.ClassConfig memory cls, HybridVoting.Layout storage l)
