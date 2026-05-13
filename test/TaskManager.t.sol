@@ -7466,4 +7466,49 @@ contract MockToken is Test, IERC20 {
                 assertEq(hats_.length, 1, "should have one organizer hat from setUp");
                 assertEq(hats_[0], ORGANIZER_HAT, "should be ORGANIZER_HAT");
             }
+
+            /*───────── cross-feature integration ─────────*/
+
+            /// @dev Locks in that the two new features (editable budgets via TaskPerm.BUDGET
+            /// and folders via organizerHatIds) are independent: a BUDGET-hat wearer cannot
+            /// touch folders, and an organizer-hat wearer cannot touch budgets. They share
+            /// the same setConfig dispatcher and the same Layout struct, so this guards
+            /// against regressions where the per-branch refactor accidentally cross-wires
+            /// permission paths.
+            function test_BudgetAndFolders_HatsAreIndependent() public {
+                uint256 BUDGET_HAT = 100;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                // Executor grants the BUDGET perm to its hat.
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                // BUDGET-hat wearer CAN edit the project's PT cap.
+                vm.prank(budgetEditor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(PID, uint256(50 ether)));
+
+                // BUDGET-hat wearer CANNOT publish folders (no organizer hat).
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.NotOrganizer.selector);
+                tm.setFolders(bytes32(0), ROOT_A);
+
+                // Organizer-hat wearer CANNOT edit budget (no BUDGET hat).
+                vm.prank(organizer);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(PID, uint256(75 ether)));
+
+                // Organizer-hat wearer CAN publish folders.
+                vm.prank(organizer);
+                tm.setFolders(bytes32(0), ROOT_A);
+                assertEq(_foldersRoot(), ROOT_A, "organizer should be able to set folders");
+
+                // Both wearers can chain their respective updates in the same session.
+                vm.prank(organizer);
+                tm.setFolders(ROOT_A, ROOT_B);
+                assertEq(_foldersRoot(), ROOT_B);
+
+                vm.prank(budgetEditor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(PID, uint256(100 ether)));
+            }
         }
