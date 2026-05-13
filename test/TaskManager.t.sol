@@ -4725,6 +4725,22 @@ contract MockToken is Test, IERC20 {
                 tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 1 ether));
             }
 
+            function test_SetConfigRolePerm_EmitsRolePermSet() public {
+                uint256 BUDGET_HAT = 50;
+
+                // Grant: executor sets BUDGET on hat -> event fires with mask=BUDGET.
+                vm.expectEmit(true, false, false, true, address(tm));
+                emit TaskManager.RolePermSet(BUDGET_HAT, TaskPerm.BUDGET);
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                // Revoke: setting mask=0 fires the event with mask=0 so indexers see the clear.
+                vm.expectEmit(true, false, false, true, address(tm));
+                emit TaskManager.RolePermSet(BUDGET_HAT, 0);
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, uint8(0)));
+            }
+
             function test_SetConfigOtherKeysStillExecutorOnly() public {
                 uint256 BUDGET_HAT = 50;
                 address budgetEditor = makeAddr("budgetEditor");

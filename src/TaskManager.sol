@@ -192,6 +192,11 @@ contract TaskManager is Initializable, ContextUpgradeable {
     event ProjectDeleted(bytes32 indexed id);
     /// @notice A hat's project-specific permission mask was updated.
     event ProjectRolePermSet(bytes32 indexed id, uint256 indexed hatId, uint8 mask);
+    /// @notice A hat's GLOBAL permission mask changed via `setConfig(ROLE_PERM, ...)`.
+    /// @dev Mirrors `ProjectRolePermSet` minus the project id. Indexers track which
+    ///      hats have which `TaskPerm` bits at the org level; `setProjectRolePerm`
+    ///      handles the per-project override.
+    event RolePermSet(uint256 indexed hatId, uint8 mask);
     /// @notice A per-project bounty-token cap changed.
     event BountyCapSet(bytes32 indexed projectId, address indexed token, uint256 oldCap, uint256 newCap);
     /// @notice The IPFS root for this org's folder tree changed.
@@ -962,6 +967,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
             (uint256 hatId, uint8 mask) = abi.decode(value, (uint256, uint8));
             l.rolePermGlobal[hatId] = mask;
             _syncPermissionHat(hatId);
+            emit RolePermSet(hatId, mask);
             return;
         }
 

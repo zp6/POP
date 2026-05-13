@@ -44,7 +44,11 @@ import {DeterministicDeployer} from "../../src/crosschain/DeterministicDeployer.
  * ABI surface:
  *   - New external: `setFolders(bytes32 expectedRoot, bytes32 newRoot)`.
  *   - New ConfigKey: `ORGANIZER_HAT_ALLOWED` (executor-only).
- *   - New events: `FoldersUpdated`, `OrganizerHatAllowed`.
+ *   - New events: `FoldersUpdated`, `OrganizerHatAllowed`, `RolePermSet`.
+ *     (The `RolePermSet` event now fires from `setConfig(ROLE_PERM, ...)` so
+ *     indexers can track global hat-permission grants — previously this
+ *     branch emitted nothing, making it impossible for the subgraph to surface
+ *     "which hats have `TaskPerm.BUDGET` globally" without RPC fan-out.)
  *   - New errors: `NotOrganizer`, `FoldersRootStale`.
  *   - New lens variants: `t == 10` (foldersRoot), `t == 11` (organizerHatIds).
  *   - New permission bit: `TaskPerm.BUDGET = 1 << 5` (granted via existing
