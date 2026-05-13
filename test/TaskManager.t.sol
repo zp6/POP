@@ -4583,21 +4583,22 @@ contract MockToken is Test, IERC20 {
             }
 
             function test_SetBountyCapPermissions() public {
-                // Only executor can set bounty caps
+                // Without the BUDGET perm, hats with other roles (creator, PM, member)
+                // cannot resize a bounty cap — they get Unauthorized.
                 vm.prank(creator1);
-                vm.expectRevert(TaskManager.NotExecutor.selector);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
                 tm.setConfig(
                     TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 5 ether)
                 );
 
                 vm.prank(pm1);
-                vm.expectRevert(TaskManager.NotExecutor.selector);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
                 tm.setConfig(
                     TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 5 ether)
                 );
 
                 vm.prank(member1);
-                vm.expectRevert(TaskManager.NotExecutor.selector);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
                 tm.setConfig(
                     TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 5 ether)
                 );
@@ -4615,6 +4616,144 @@ contract MockToken is Test, IERC20 {
                 );
                 (uint256 cap, uint256 spent) = abi.decode(result, (uint256, uint256));
                 assertEq(cap, 5 ether, "Executor should be able to set bounty cap");
+            }
+
+            /*───────────────── EDITABLE BUDGETS (TaskPerm.BUDGET) ───────────────────*/
+
+            function test_BudgetEditByHatHolder_PT() public {
+                uint256 BUDGET_HAT = 50;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                vm.prank(budgetEditor);
+                vm.expectEmit(true, false, false, true);
+                emit TaskManager.ProjectCapUpdated(BUDGET_PROJECT_ID, 10 ether, 20 ether);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 20 ether));
+            }
+
+            function test_BudgetEditByHatHolder_Bounty() public {
+                uint256 BUDGET_HAT = 50;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                vm.prank(budgetEditor);
+                vm.expectEmit(true, true, false, true);
+                emit TaskManager.BountyCapSet(BUDGET_PROJECT_ID, address(bountyToken1), type(uint128).max, 7 ether);
+                tm.setConfig(
+                    TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 7 ether)
+                );
+            }
+
+            function test_BudgetEditByProjectScopedHat() public {
+                uint256 BUDGET_HAT = 50;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                // Grant BUDGET only on BUDGET_PROJECT_ID (not on UNLIMITED_PROJECT_ID).
+                vm.prank(creator1);
+                tm.setProjectRolePerm(BUDGET_PROJECT_ID, BUDGET_HAT, TaskPerm.BUDGET);
+
+                vm.prank(budgetEditor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 20 ether));
+
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(UNLIMITED_PROJECT_ID, 20 ether));
+            }
+
+            function test_BudgetEditByProjectManager_RevertsWithoutHat() public {
+                // Make pm1 a project manager on BUDGET_PROJECT_ID (no BUDGET hat).
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_MANAGER, abi.encode(BUDGET_PROJECT_ID, pm1, true));
+
+                vm.prank(pm1);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 20 ether));
+
+                vm.prank(pm1);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(
+                    TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 5 ether)
+                );
+            }
+
+            function test_BudgetEditWithoutPermReverts() public {
+                address nobody = makeAddr("nobody");
+
+                vm.prank(nobody);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 20 ether));
+
+                vm.prank(nobody);
+                vm.expectRevert(TaskManager.Unauthorized.selector);
+                tm.setConfig(
+                    TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 5 ether)
+                );
+            }
+
+            function test_BudgetEditByExecutor_StillWorks() public {
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 20 ether));
+
+                vm.prank(executor);
+                tm.setConfig(
+                    TaskManager.ConfigKey.BOUNTY_CAP, abi.encode(BUDGET_PROJECT_ID, address(bountyToken1), 6 ether)
+                );
+            }
+
+            function test_BudgetEditCannotLowerBelowSpent() public {
+                uint256 BUDGET_HAT = 50;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                // Consume 2 ether of PT on BUDGET_PROJECT_ID (cap = 10 ether).
+                vm.prank(creator1);
+                tm.createTask(2 ether, bytes("burn"), bytes32(0), BUDGET_PROJECT_ID, address(0), 0, false);
+
+                // Hat-holder cannot lower cap below committed spend.
+                vm.prank(budgetEditor);
+                vm.expectRevert(ValidationLib.CapBelowCommitted.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_CAP, abi.encode(BUDGET_PROJECT_ID, 1 ether));
+            }
+
+            function test_SetConfigOtherKeysStillExecutorOnly() public {
+                uint256 BUDGET_HAT = 50;
+                address budgetEditor = makeAddr("budgetEditor");
+                setHat(budgetEditor, BUDGET_HAT);
+
+                vm.prank(executor);
+                tm.setConfig(TaskManager.ConfigKey.ROLE_PERM, abi.encode(BUDGET_HAT, TaskPerm.BUDGET));
+
+                // EXECUTOR key — still executor-only.
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.NotExecutor.selector);
+                tm.setConfig(TaskManager.ConfigKey.EXECUTOR, abi.encode(makeAddr("newExec")));
+
+                // CREATOR_HAT_ALLOWED key — still executor-only.
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.NotExecutor.selector);
+                tm.setConfig(TaskManager.ConfigKey.CREATOR_HAT_ALLOWED, abi.encode(uint256(123), true));
+
+                // ROLE_PERM key — still executor-only (callers must not be able to grant themselves perms).
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.NotExecutor.selector);
+                tm.setConfig(
+                    TaskManager.ConfigKey.ROLE_PERM, abi.encode(uint256(99), TaskPerm.CREATE | TaskPerm.BUDGET)
+                );
+
+                // PROJECT_MANAGER key — still executor-only.
+                vm.prank(budgetEditor);
+                vm.expectRevert(TaskManager.NotExecutor.selector);
+                tm.setConfig(TaskManager.ConfigKey.PROJECT_MANAGER, abi.encode(BUDGET_PROJECT_ID, member1, true));
             }
 
             function test_SetBountyCapValidation() public {

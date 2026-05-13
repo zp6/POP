@@ -775,10 +775,10 @@ contract TaskManager is Initializable, ContextUpgradeable {
 
     /*──────── Config Setter (Optimized) ─────── */
     function setConfig(ConfigKey key, bytes calldata value) external {
-        _requireExecutor();
         Layout storage l = _layout();
 
         if (key == ConfigKey.EXECUTOR) {
+            _requireExecutor();
             address newExecutor = abi.decode(value, (address));
             newExecutor.requireNonZeroAddress();
             l.executor = newExecutor;
@@ -787,6 +787,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
         }
 
         if (key == ConfigKey.CREATOR_HAT_ALLOWED) {
+            _requireExecutor();
             (uint256 hat, bool allowed) = abi.decode(value, (uint256, bool));
             HatManager.setHatInArray(l.creatorHatIds, hat, allowed);
             emit HatSet(HatType.CREATOR, hat, allowed);
@@ -794,6 +795,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
         }
 
         if (key == ConfigKey.ROLE_PERM) {
+            _requireExecutor();
             (uint256 hatId, uint8 mask) = abi.decode(value, (uint256, uint8));
             l.rolePermGlobal[hatId] = mask;
             _syncPermissionHat(hatId);
@@ -808,6 +810,7 @@ contract TaskManager is Initializable, ContextUpgradeable {
             if (!p.exists) revert NotFound();
 
             if (key == ConfigKey.BOUNTY_CAP) {
+                _requireBudgetEditor(pid);
                 (, address token, uint256 newCap) = abi.decode(value, (bytes32, address, uint256));
                 token.requireNonZeroAddress();
                 ValidationLib.requireValidCapAmount(newCap);
@@ -817,11 +820,13 @@ contract TaskManager is Initializable, ContextUpgradeable {
                 b.cap = uint128(newCap);
                 emit BountyCapSet(pid, token, oldCap, newCap);
             } else if (key == ConfigKey.PROJECT_MANAGER) {
+                _requireExecutor();
                 (, address mgr, bool isManager) = abi.decode(value, (bytes32, address, bool));
                 mgr.requireNonZeroAddress();
                 p.managers[mgr] = isManager;
                 emit ProjectManagerUpdated(pid, mgr, isManager);
             } else if (key == ConfigKey.PROJECT_CAP) {
+                _requireBudgetEditor(pid);
                 (, uint256 newCap) = abi.decode(value, (bytes32, uint256));
                 ValidationLib.requireValidCapAmount(newCap);
                 ValidationLib.requireValidCap(newCap, p.spent);
@@ -887,6 +892,15 @@ contract TaskManager is Initializable, ContextUpgradeable {
     function _checkPerm(bytes32 pid, uint8 flag) internal view {
         address s = _msgSender();
         if (!TaskPerm.has(_permMask(s, pid), flag) && !_isPM(pid, s)) revert Unauthorized();
+    }
+
+    /// @dev Stricter than `_checkPerm`: no project-manager bypass. Only Executor
+    /// or a wearer of a hat granted `TaskPerm.BUDGET` (globally via `ROLE_PERM`
+    /// or per-project via `setProjectRolePerm`) may resize a project's caps.
+    function _requireBudgetEditor(bytes32 pid) internal view {
+        address s = _msgSender();
+        if (s == _layout().executor) return;
+        if (!TaskPerm.has(_permMask(s, pid), TaskPerm.BUDGET)) revert Unauthorized();
     }
 
     function _setBatchHatPerm(bytes32 pid, uint256[] calldata hatIds, uint8 flag) internal {
