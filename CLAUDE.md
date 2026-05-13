@@ -89,11 +89,12 @@ Any new forge script that mutates on-chain state (`Hub.adminCall`, `Hub.adminCal
 2. The admin EOA for Hub / Satellite / paymaster admin calls is **`0xA6F4D9f44Dd980b7168D829d5f74c2b00a46b2c9`** (Hudson). Owners of `PoaManagerHub` (Arbitrum) and `PoaManagerSatellite` (Gnosis) are this address — prank as it, don't read `Hub.owner()` and reuse the result, in case ownership ever changes mid-fork.
 3. Sims must call `getRule` / `getCurrentImplementationById` / etc. **before and after** the mutation and `require()` the expected change. Don't trust events alone — match the actual return type of the read function (e.g. PaymasterHub's `getRule` returns `Rule { uint32 maxCallGasHint; bool allowed }`, in that field order — decoding it as `(bool, uint32)` silently swaps the values).
 4. For cross-chain state (Hub on Arbitrum dispatching to Gnosis Satellite), prefer running on the destination chain via `Satellite.adminCall` over Hyperlane'd `adminCallCrossChain` — same destination effect, no 0.005 ETH fee, no 5-min relay wait. Cross-chain dispatch is also ~impossible to fully simulate locally.
-5. Run the sim end-to-end and confirm `PASS` output before writing any "ready to broadcast" message:
+5. Run the sim end-to-end **under `FOUNDRY_PROFILE=production`** and confirm `PASS` output before writing any "ready to broadcast" message:
    ```sh
-   forge script <path>:SimX --fork-url <chain> -vvv
+   FOUNDRY_PROFILE=production forge script <path>:SimX --fork-url <chain> -vvv
    ```
-6. Production profile (`FOUNDRY_PROFILE=production`) on this branch currently has a pre-existing `Stack too deep` issue independent of any single script — default profile is the one that has to compile cleanly for every change.
+   This is non-negotiable: broadcast uses the production profile (optimizer on, `evm=cancun`), so a default-profile sim deploys *different bytecode* than what will actually go to mainnet — different gas, different optimizer rewrites, different EVM target. A default-profile sim is not a real sim. Only fall back to default profile if you've confirmed the script hits the pre-existing production-profile `Stack too deep` (see point 6) — in which case the sim isn't broadcast-safe and you need to refactor the script.
+6. Production profile (`FOUNDRY_PROFILE=production`) on this branch has a pre-existing `Stack too deep` issue in *some* paths independent of any single script — default profile is the one that has to compile cleanly for every change (CI gate). But sims and broadcasts must still run under production profile (point 5). If your specific script hits the production-profile error, that's a real blocker, not a license to skip it.
 
 ## Subgraph (live deployment lookups)
 
